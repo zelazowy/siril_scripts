@@ -2,15 +2,16 @@
 """
 ASTAP plate-solving helper for Siril 1.4.
 
-This script exports the current Siril image to FITS, optionally mirrors it
-horizontally, asks ASTAP to solve and update that FITS header, then loads the
-solved FITS back into Siril.
+This script exports the current Siril image to a temporary FITS, asks ASTAP to
+solve and update that FITS header, then imports the solved result back into the
+current Siril image and overwrites the source FITS file.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import selectors
 import subprocess
 import sys
 import tempfile
@@ -28,7 +29,6 @@ from PyQt6 import QtCore, QtWidgets
 VERSION = "0.1.0"
 WINDOW_TITLE = f"ASTAP Plate Solve for Siril {VERSION}"
 DEFAULT_RADIUS_DEG = 30
-WIDE_RADIUS_DEG = 90
 DEFAULT_BLIND_RADIUS_DEG = 180
 FITS_SUFFIXES = {".fit", ".fits", ".fts"}
 DEFAULT_ASTAP_NAMES = (
@@ -51,36 +51,6 @@ def parse_key_value_text(text: str) -> dict[str, str]:
         value = value.split("//", 1)[0].strip().strip('"')
         values[key.strip().upper()] = value
     return values
-
-
-def parse_header_numeric_value(header_text: str, key: str) -> float | None:
-    for raw_line in header_text.splitlines():
-        line = raw_line.strip()
-        if not line.startswith(f"{key}=") and not line.startswith(f"{key} ="):
-            continue
-        _, value = line.split("=", 1)
-        value = value.split("/", 1)[0].strip().strip("'")
-        try:
-            return float(value)
-        except ValueError:
-            return None
-    return None
-
-
-def header_represents_flipped_image(header_text: str) -> bool:
-    cd11 = parse_header_numeric_value(header_text, "CD1_1")
-    cd12 = parse_header_numeric_value(header_text, "CD1_2")
-    cd21 = parse_header_numeric_value(header_text, "CD2_1")
-    cd22 = parse_header_numeric_value(header_text, "CD2_2")
-    if None not in (cd11, cd12, cd21, cd22):
-        return (cd11 * cd22 - cd12 * cd21) > 0
-
-    cdelt1 = parse_header_numeric_value(header_text, "CDELT1")
-    cdelt2 = parse_header_numeric_value(header_text, "CDELT2")
-    if None not in (cdelt1, cdelt2):
-        return (cdelt1 * cdelt2) > 0
-
-    return False
 
 
 class AstapPlateSolveDialog(QtWidgets.QDialog):
@@ -213,7 +183,7 @@ class AstapPlateSolveDialog(QtWidgets.QDialog):
         input_path: Path,
         strategy_name: str,
         radius_deg: int,
-        blind_solve: bool,
+        use_auto_fov: bool,
     ) -> tuple[dict[str, str], str]:
         for sidecar in (".ini", ".wcs", ".log"):
             sidecar_path = input_path.with_suffix(sidecar)
@@ -225,7 +195,7 @@ class AstapPlateSolveDialog(QtWidgets.QDialog):
             "-f",
             str(input_path),
             "-r",
-            str(DEFAULT_BLIND_RADIUS_DEG if blind_solve else radius_deg),
+            str(radius_deg),
             "-z",
             "0",
             "-sip",
@@ -233,8 +203,7 @@ class AstapPlateSolveDialog(QtWidgets.QDialog):
             "-wcs",
             "-progress",
         ]
-
-        if blind_solve:
+        if use_auto_fov:
             command.extend(["-fov", "0"])
 
         self._append_log(f"Strategy: {strategy_name}")
@@ -251,15 +220,22 @@ class AstapPlateSolveDialog(QtWidgets.QDialog):
 
         output_lines: list[str] = []
         assert process.stdout is not None
+
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
         while True:
-            line = process.stdout.readline()
-            if line:
-                clean_line = line.rstrip()
-                output_lines.append(clean_line)
-                self._append_log(clean_line)
+            events = selector.select(timeout=0.2)
+            if events:
+                line = process.stdout.readline()
+                if line:
+                    clean_line = line.rstrip()
+                    output_lines.append(clean_line)
+                    self._append_log(clean_line)
             if process.poll() is not None:
                 break
             QtWidgets.QApplication.processEvents()
+        selector.unregister(process.stdout)
+        selector.close()
 
         trailing_output = process.stdout.read()
         if trailing_output:
@@ -326,26 +302,23 @@ class AstapPlateSolveDialog(QtWidgets.QDialog):
 
                     attempts = (
                         ("Header-guided solve", DEFAULT_RADIUS_DEG, False),
-                        ("Wider search", WIDE_RADIUS_DEG, False),
-                        ("Blind solve", DEFAULT_BLIND_RADIUS_DEG, True),
+                        ("Blind auto-FOV solve", DEFAULT_BLIND_RADIUS_DEG, True),
                     )
                     latest_ini: dict[str, str] | None = None
-                    latest_header = ""
 
-                    for strategy_name, radius_deg, blind_solve in attempts:
+                    for strategy_name, radius_deg, use_auto_fov in attempts:
                         latest_ini, _ = self._run_astap(
                             astap_path,
                             working_path,
                             strategy_name,
                             radius_deg,
-                            blind_solve,
+                            use_auto_fov,
                         )
                         if latest_ini.get("PLTSOLVD", "").upper() == "T":
                             solved_fit = self.siril.load_image_from_file(str(working_path), with_pixels=True)
                             if solved_fit is None or solved_fit.header is None:
                                 raise RuntimeError("Could not read the solved FITS produced by ASTAP.")
-                            latest_header = solved_fit.header
-                            return latest_ini, latest_header
+                            return latest_ini, solved_fit.header
 
                         error_message = latest_ini.get("ERROR", "ASTAP did not return a solution.")
                         warning_message = latest_ini.get("WARNING", "")
@@ -359,12 +332,7 @@ class AstapPlateSolveDialog(QtWidgets.QDialog):
                     full_message = error_message if not warning_message else f"{error_message}\nWarning: {warning_message}"
                     raise RuntimeError(full_message)
 
-                ini_values, solved_header = solve_with_strategies(working_pixels)
-
-                if header_represents_flipped_image(solved_header):
-                    self._append_log("ASTAP solved a mirrored image. Re-solving after automatic horizontal flip.")
-                    working_pixels = np.ascontiguousarray(np.flip(original_pixels, axis=-1))
-                    ini_values, solved_header = solve_with_strategies(working_pixels)
+                ini_values, _ = solve_with_strategies(working_pixels)
 
                 solved_fit = self.siril.load_image_from_file(str(working_path), with_pixels=True)
                 if solved_fit is None or solved_fit.data is None or solved_fit.header is None:

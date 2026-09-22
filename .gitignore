@@ -1,0 +1,11 @@
+# macOS metadata
+.DS_Store
+
+# Python bytecode and environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local script backups
+*.bak

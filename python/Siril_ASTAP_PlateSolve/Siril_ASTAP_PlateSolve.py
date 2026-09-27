@@ -28,7 +28,7 @@ s.ensure_installed("PyQt6")
 from PyQt6 import QtCore, QtWidgets
 
 
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 ASTAP_TIMEOUT_SECONDS = 180
 WINDOW_TITLE = f"ASTAP Plate Solve for Siril {VERSION}"
 DEFAULT_RADIUS_DEG = 30
@@ -105,6 +105,32 @@ def header_cards(header: str) -> list[str]:
     return result
 
 
+def image_is_mirrored(header: str) -> bool:
+    """Use the same celestial CD-matrix parity convention as Siril."""
+    values = {}
+    for card in header_cards(header):
+        if card[8:10] == "= ":
+            values[card[:8].strip()] = card[10:].split("/", 1)[0].strip()
+
+    def number(key: str, default=None) -> float:
+        value = values.get(key, default)
+        if value is None:
+            raise RuntimeError(f"Missing WCS keyword: {key}")
+        return float(str(value).replace("D", "E"))
+
+    if any(key in values for key in ("CD1_1", "CD1_2", "CD2_1", "CD2_2")):
+        matrix = np.array([[number("CD1_1", 0), number("CD1_2", 0)],
+                           [number("CD2_1", 0), number("CD2_2", 0)]])
+    else:
+        matrix = np.array([[number("PC1_1", 1), number("PC1_2", 0)],
+                           [number("PC2_1", 0), number("PC2_2", 1)]])
+        matrix *= np.array([number("CDELT1"), number("CDELT2")])[:, None]
+    determinant = float(np.linalg.det(matrix))
+    if not np.isfinite(determinant) or determinant == 0:
+        raise RuntimeError("Invalid WCS matrix; cannot determine image mirroring.")
+    return determinant > 0
+
+
 def merge_astrometry(original: str, solved: str) -> str:
     """Copy only sky coordinates, never mono geometry or proxy intensity metadata."""
     solution = [card for card in header_cards(solved)
@@ -154,6 +180,14 @@ class AstapPlateSolveDialog(QtWidgets.QDialog):
         path_row.addWidget(browse_button)
         layout.addLayout(path_row)
 
+        self.correct_mirror_check = QtWidgets.QCheckBox("Correct mirrored image if needed")
+        self.correct_mirror_check.setChecked(True)
+        self.correct_mirror_check.setToolTip(
+            "Match Siril's plate-solving flip convention. Preserves pixel values "
+            "and updates the coordinate solution; does not rotate north-up."
+        )
+        layout.addWidget(self.correct_mirror_check)
+
         self.solve_button = QtWidgets.QPushButton("Solve")
         self.solve_button.clicked.connect(self._solve_current_image)
         layout.addWidget(self.solve_button)
@@ -190,10 +224,12 @@ class AstapPlateSolveDialog(QtWidgets.QDialog):
         except (OSError, json.JSONDecodeError):
             return
         self.path_edit.setText(config.get("astap_path", ""))
+        self.correct_mirror_check.setChecked(config.get("correct_mirror", True))
 
     def _save_config(self) -> None:
         config = {
             "astap_path": self.path_edit.text().strip(),
+            "correct_mirror": self.correct_mirror_check.isChecked(),
         }
         self.config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
@@ -208,6 +244,7 @@ class AstapPlateSolveDialog(QtWidgets.QDialog):
     def _set_busy(self, busy: bool) -> None:
         self.solve_button.setEnabled(not busy)
         self.path_edit.setEnabled(not busy)
+        self.correct_mirror_check.setEnabled(not busy)
         if busy:
             QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
         else:
@@ -434,6 +471,28 @@ class AstapPlateSolveDialog(QtWidgets.QDialog):
                     raise RuntimeError("Siril could not verify the imported sky coordinates.")
                 self._append_log("Siril verified the imported plate solution.")
 
+                if self.correct_mirror_check.isChecked():
+                    if image_is_mirrored(solved_header):
+                        self._append_log("Mirrored image detected; correcting with Siril's mirror command.")
+                        # Run outside image_lock: Siril commands claim their own thread.
+                        # Siril transforms both pixels and WCS, including SIP distortion.
+                        self.siril.cmd("mirrorx")
+                        original_pixels = self.siril.get_image_pixeldata()
+                        solved_header = self.siril.get_image_fits_header()
+                        if original_pixels is None or not isinstance(solved_header, str):
+                            raise RuntimeError("Could not read the corrected image from Siril.")
+                        if image_is_mirrored(solved_header):
+                            raise RuntimeError("Siril did not correct the image mirroring.")
+                        sky_position = self.siril.pix2radec(
+                            original_pixels.shape[-1] / 2,
+                            original_pixels.shape[-2] / 2,
+                        )
+                        if sky_position is None or not np.isfinite(sky_position).all():
+                            raise RuntimeError("Could not verify WCS after mirror correction.")
+                        self._append_log("Mirroring corrected; pixel values and sky coordinates preserved.")
+                    else:
+                        self._append_log("Image orientation is already unmirrored; no flip needed.")
+
                 if not self.siril.save_image_file(original_pixels, solved_header, str(output_path)):
                     raise RuntimeError(f"Could not save the solved image to {output_path}")
                 self._append_log(f"Solved FITS updated: {output_path}")
@@ -467,7 +526,7 @@ class AstapPlateSolveDialog(QtWidgets.QDialog):
                 "Siril busy",
                 f"Siril is busy with another image operation: {exc}",
             )
-        except (NoImageError, SirilError, OSError, RuntimeError) as exc:
+        except (NoImageError, SirilError, OSError, RuntimeError, ValueError) as exc:
             self._append_log(f"Error: {exc}")
             QtWidgets.QMessageBox.critical(self, "Plate solve failed", str(exc))
         finally:

@@ -6,6 +6,7 @@ Custom and modified scripts for astronomical image processing with Siril.
 
 | Script | Purpose |
 | --- | --- |
+| [SAS-style Star Stretch](python/Siril_SAS_Star_Stretch/) | Stretch a stars-only image using the SAS Pro Star Stretch mathematics, with colour boost and optional SCNR. |
 | [ASTAP Plate Solve](python/Siril_ASTAP_PlateSolve/) | Solve the current FITS or TIFF image with ASTAP and import the coordinate solution into Siril. |
 | [Blink / Browse / Filter / Sort](python/Blink_Browse_Filter_Sort/) | Review image sequences or folders, compare image quality, recommend keepers, and sort or filter frames. |
 

@@ -8,7 +8,7 @@ These utilities run from Siril's GUI with Python scripting support. Each linked 
 
 | Script | What it does | Typical use |
 | --- | --- | --- |
-| [Align Stacks](python/Siril_Align_Stacks/) | Aligns a few RGB or mono FITS stacks with translation, rotation and scale; provides adaptive previews and automatic or manual shared cropping; saves copies with an `_aligned` suffix. | Prepare RGB and narrowband stacks for continuum subtraction without creating a sequence or intermediate image files. |
+| [Align Stacks](python/Siril_Align_Stacks/) | Aligns a few RGB or mono FITS stacks using similarity matching or independent SIP astrometry (Siril 1.4.4); provides adaptive previews, shared cropping and centre/outer stellar residuals; saves `_aligned` or `_aligned_sip` copies. | Prepare RGB and narrowband stacks for continuum subtraction. SIP mode independently solves/undistorts every stack on a common grid, using a private temporary sequence and one science resampling. |
 | [ASTAP Plate Solve](python/Siril_ASTAP_PlateSolve/) | Solves the current FITS or TIFF image with ASTAP and imports the coordinate solution into Siril. | Add astrometry to an image for coordinate-aware processing. |
 | [Blink / Browse / Filter / Sort](python/Blink_Browse_Filter_Sort/) | Reviews sequences or image folders, compares image quality, recommends keepers, and sorts or filters frames. | Inspect exposures and choose frames before stacking. |
 | [SAS-style Star Stretch](python/Siril_SAS_Star_Stretch/) | Stretches a stars-only mono or RGB image using SAS Pro Star Stretch mathematics, with colour boost, optional SCNR, and a preview. | Adjust a separated stars layer before recombining it with the starless image. |

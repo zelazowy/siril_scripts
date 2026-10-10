@@ -1,15 +1,447 @@
 """Align a few mono/RGB FITS stacks; run from Siril's Python menu.
 
-Version 1.0.0. Also runs standalone when dependencies are installed.
-Star matching estimates translation, rotation and uniform scale. Pixels are
-resampled once with linear interpolation, without intensity normalization.
+Also runs standalone when dependencies are installed. Similarity matching or
+Siril 1.4.4 sequence SIP astrometry; one linear resampling of science pixels.
 """
 import sys
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import configparser
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
-VERSION = "1.0.3"
+VERSION = "1.1.0"
+
+
+@dataclass
+class SIPOptions:
+    executable: str = ""
+    config: str = ""
+    order: int = 3
+    solver: str = "siril"  # siril, astrometry.net, existing
+    timeout: int = 900
+
+
+def find_siril_cli():
+    candidates = [shutil.which("siril-cli"),
+                  "/Applications/Siril.app/Contents/MacOS/siril-cli"]
+    # Siril's bundled Python may live beside its executable on Windows.
+    candidates += [str(Path(sys.executable).parent / name)
+                   for name in ("siril-cli", "siril-cli.exe")]
+    return next((str(p) for p in candidates if p and Path(p).is_file()), "")
+
+
+def find_siril_config(configdir=None):
+    roots = [Path(configdir)] if configdir else []
+    roots += [Path.home()/"Library/Application Support/org.siril.Siril/siril",
+              Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home()/".config")))/"siril",
+              Path(os.environ.get("LOCALAPPDATA", str(Path.home())))/"siril"]
+    return next((str(root/name) for root in roots
+                 for name in ("config.1.4.ini", "config.ini")
+                 if (root/name).is_file()), "")
+
+
+def run_siril(options, directory, commands, report=lambda message: None):
+    """Run in an isolated CLI, never changing the GUI's current image/sequence."""
+    script = Path(directory)/"align_commands.ssf"
+    script.write_text("requires 1.4.4\n" + "\n".join(commands) + "\n", encoding="utf-8")
+    environment = os.environ.copy()
+    environment["LC_ALL"] = "C"
+    environment["LANGUAGE"] = "C"
+    # Linux respects these locations. macOS Siril overrides XDG variables;
+    # protect its eager Python environment repair with an OS write sandbox.
+    environment["XDG_DATA_HOME"] = str(Path(options.config).parent/"runtime-data")
+    environment["XDG_CACHE_HOME"] = str(Path(options.config).parent/"runtime-cache")
+    command = [options.executable, "-i", options.config,
+               "-d", str(directory), "-s", str(script)]
+    if sys.platform == "darwin":
+        import json
+        sandbox = shutil.which("sandbox-exec")
+        if not sandbox:
+            raise RuntimeError("macOS SIP mode needs sandbox-exec to protect Siril's Python environment.")
+        protected = Path.home()/"Library/Application Support/org.siril.Siril/siril/venv"
+        profile = '(version 1)(allow default)(deny file-write* (subpath ' + json.dumps(str(protected)) + '))'
+        command = [sandbox, "-p", profile, *command]
+    try:
+        result = subprocess.run(command,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, errors="replace", timeout=options.timeout,
+                                env=environment)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Siril timed out; no corrected results were accepted.") from exc
+    log = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", result.stdout)
+    for line in log.splitlines():
+        if line.startswith("log:") and not any(s in line for s in
+            ("Running command:", "Reading configuration", "Setting CWD", "Supported file types:")):
+            report(line[4:].strip())
+    # Some failed Siril scripts return exit code 0: check the terminal status too.
+    if result.returncode or "Script execution finished successfully." not in log:
+        raise RuntimeError("Siril command batch failed; no fallback was used.\n" +
+                           "\n".join(log.splitlines()[-14:]))
+    return log
+
+
+def check_siril(options, directory, report):
+    if not Path(options.executable).is_file():
+        raise ValueError("Choose the installed siril-cli executable in SIP settings.")
+    version = subprocess.run([options.executable, "--version"], capture_output=True,
+                             text=True, timeout=15)
+    match = re.search(r"\bsiril\s+(\d+)\.(\d+)\.(\d+)", version.stdout+version.stderr, re.I)
+    if not match or version.returncode:
+        raise ValueError("Could not determine the selected Siril CLI version.")
+    number = tuple(map(int, match.groups()))
+    if number < (1, 4, 4) or number[:2] != (1, 4):
+        raise ValueError("SIP mode requires Siril 1.4.4 (or a later 1.4 patch). "
+                         "Other command/API versions have not been verified.")
+    report(f"Siril CLI {'.'.join(match.groups())}; checking supported command options.")
+    help_log = run_siril(options, directory, ["help seqplatesolve", "help seqapplyreg",
+                                            "help convert", "help setref"], lambda _: None)
+    for token in ("-order=", "-force", "-nocache", "-nocrop", "-localasnet",
+                  "-framing=", "-interp=", "-layer=", "-out=", "setref sequencename"):
+        if token not in help_log:
+            raise ValueError(f"Selected Siril lacks the verified command option {token}.")
+    return '.'.join(match.groups())
+
+
+def validate_sip(header, shape, order):
+    """Reject linear, zero, malformed or non-invertible distortion solutions."""
+    from astropy.wcs import WCS
+    if not 2 <= order <= 5:
+        raise ValueError("SIP order must be between 2 and 5.")
+    for key in ("A_ORDER", "B_ORDER"):
+        if header.get(key) != order:
+            raise ValueError(f"Expected {key}={order}; got {header.get(key)!r}. "
+                             "A linear or lower-order solve is not accepted.")
+    if not all(str(header.get(f"CTYPE{i}", "")).endswith("-SIP") for i in (1, 2)):
+        raise ValueError("Missing celestial TAN-SIP axis declarations.")
+    coefficients = []
+    for prefix in ("A", "B"):
+        for key in header:
+            match = re.fullmatch(prefix+r"_(\d+)_(\d+)", key)
+            if match:
+                i, j = map(int, match.groups())
+                value = float(header[key])
+                if not np.isfinite(value) or i+j > order or (i+j < 2 and value != 0):
+                    raise ValueError(f"Invalid SIP coefficient {key}.")
+                coefficients.append(value)
+    if not coefficients or not np.any(np.asarray(coefficients) != 0):
+        raise ValueError("No nonzero SIP distortion coefficients; correction not verified.")
+    # Siril 1.4.4's interpolation path uses the reverse AP/BP polynomials.
+    # Forward-only SIP is legal FITS WCS, but is not sufficient for this backend.
+    for prefix in ("AP", "BP"):
+        inverse_order = header.get(prefix+"_ORDER")
+        if not isinstance(inverse_order, int) or not 2 <= inverse_order <= 5:
+            raise ValueError(f"Missing valid {prefix}_ORDER inverse SIP model; "
+                             "re-solve this stack in Siril instead of reusing it.")
+        terms = [float(header[key]) for key in header
+                 if re.fullmatch(prefix+r"_\d+_\d+", key)]
+        if not terms or not np.isfinite(terms).all():
+            raise ValueError(f"Invalid or missing {prefix} inverse coefficients.")
+    wcs = WCS(header, naxis=2)
+    if not wcs.has_celestial or wcs.sip is None:
+        raise ValueError("Not a valid celestial SIP solution.")
+    h, w = shape[-2:]
+    xx, yy = np.meshgrid(np.linspace(0, w-1, 9), np.linspace(0, h-1, 9))
+    points = np.column_stack((xx.ravel(), yy.ravel()))
+    world = wcs.all_pix2world(points, 0)
+    inverse = wcs.all_world2pix(world, 0, tolerance=1e-5, maxiter=100,
+                               adaptive=True, detect_divergence=True)
+    if not np.isfinite(world).all() or not np.isfinite(inverse).all() or \
+            np.max(np.linalg.norm(inverse-points, axis=1)) > .01:
+        raise ValueError("SIP solution fails a full-field inverse round-trip check.")
+    reverse = wcs.sip_foc2pix(wcs.sip_pix2foc(points, 0), 0)
+    error = float(np.max(np.linalg.norm(reverse-points, axis=1)))
+    if not np.isfinite(reverse).all() or error > .25:
+        raise ValueError(f"SIP reverse polynomials differ from forward model by {error:.3f} px "
+                         "(limit 0.25 px); re-solve or lower the polynomial order.")
+    return wcs
+
+
+def refine_inverse_sip(header, shape):
+    """Fit inverse evaluation polynomials, keeping the solved forward WCS fixed.
+
+    Siril uses AP/BP directly rather than numerically inverting A/B. Its cubic
+    inverse can be too approximate on large stacks; degree five is supported
+    by 1.4.4. This changes coordinate evaluation only, never science pixels.
+    """
+    from astropy.wcs import WCS
+    result = header.copy()
+    wcs = WCS(header, naxis=2)
+    h, w = shape[-2:]
+    scale = float(max(h, w))
+    terms = [(i, j) for i in range(6) for j in range(6-i)]
+    xx, yy = np.meshgrid(np.linspace(-2, w+1, 65), np.linspace(-2, h+1, 65))
+    points = np.column_stack((xx.ravel(), yy.ravel()))
+    uv = points+1-wcs.wcs.crpix
+    forward = wcs.sip_pix2foc(points, 0)+1  # SIP focal API honours origin=0
+    design = np.column_stack([(forward[:, 0]/scale)**i *
+                              (forward[:, 1]/scale)**j for i, j in terms])
+    coefficients = np.linalg.lstsq(design, uv-forward, rcond=None)[0]
+    for key in list(result):
+        if re.fullmatch(r"(?:AP|BP)_(?:ORDER|\d+_\d+)", key):
+            del result[key]
+    for axis, prefix in enumerate(("AP", "BP")):
+        result[prefix+"_ORDER"] = 5
+        for (i, j), values in zip(terms, coefficients):
+            result[f"{prefix}_{i}_{j}"] = float(values[axis]/scale**(i+j))
+    refined = WCS(result, naxis=2)
+    # Independent denser validation points, including every image boundary.
+    xx, yy = np.meshgrid(np.linspace(0, w-1, 97), np.linspace(0, h-1, 97))
+    points = np.column_stack((xx.ravel(), yy.ravel()))
+    reverse = refined.sip_foc2pix(refined.sip_pix2foc(points, 0), 0)
+    error = float(np.max(np.linalg.norm(reverse-points, axis=1)))
+    if not np.isfinite(error) or error > .05:
+        raise ValueError(f"Refined inverse SIP is inaccurate ({error:.3f} px); solve rejected.")
+    validate_sip(result, shape, int(result["A_ORDER"]))
+    return result, error
+
+
+def check_registration_file(path, count):
+    """Check the native v6 sequence: every frame included, per-image distortion."""
+    lines = path.read_text().splitlines()
+    if "D1 4" not in lines:  # DISTO_FILES in Siril 1.4.4, not a shared master
+        raise ValueError("Siril did not record per-image astrometric distortion data.")
+    included = [line.split() for line in lines if line.startswith("I ")]
+    if len(included) != count or any(row[2] != "1" for row in included):
+        raise ValueError("Siril excluded one or more unsolved stacks; batch rejected.")
+    rows = [line for line in lines if line.startswith("R1 ")]
+    if len(rows) != count:
+        raise ValueError("Missing astrometric registration entries.")
+    for row in rows:
+        if " H " not in row:
+            raise ValueError("Missing astrometric projection matrix.")
+        matrix = np.array(list(map(float, row.split(" H ")[1].split()))).reshape(3, 3)
+        if not np.isfinite(matrix).all() or abs(np.linalg.det(matrix)) < 1e-12:
+            raise ValueError("Invalid astrometric projection matrix.")
+
+
+def same_output_grid(headers, shape):
+    from astropy.wcs import WCS
+    reference = WCS(headers[0], naxis=2)
+    if not reference.has_celestial or reference.sip is not None:
+        raise ValueError("Siril output is not a distortion-free celestial projection.")
+    h, w = shape
+    points = np.array([[0, 0], [w-1, 0], [0, h-1], [w-1, h-1], [w/2, h/2]])
+    world = reference.all_pix2world(points, 0)
+    for header in headers[1:]:
+        current = WCS(header, naxis=2)
+        if current.sip is not None or not current.has_celestial or \
+                not np.allclose(current.all_world2pix(world, 0), points, atol=1e-4, rtol=0):
+            raise ValueError("Exported stacks do not share a common undistorted WCS grid.")
+
+
+def stellar_centroids(data):
+    import sep
+    image = np.ascontiguousarray(mono(data), dtype=np.float32)
+    # Large stacks can exceed SEP's default 300k active-pixel buffer.
+    sep.set_extract_pixstack(max(300000, min(5000000, image.size//10)))
+    padding = np.ascontiguousarray(image == 0)
+    background = sep.Background(image, mask=padding)
+    objects = sep.extract(image-background.back(), 5, err=background.rms(),
+                          minarea=5, mask=padding)
+    objects = objects[(objects['flag'] == 0) & np.isfinite(objects['x']) & np.isfinite(objects['y'])]
+    objects = objects[np.argsort(objects['flux'])[-2000:]]
+    return np.column_stack((objects['x'], objects['y']))
+
+
+def centroid_residuals(reference, moving, shape, mask=None, max_distance=5):
+    """Mutual nearest neighbours, without fitting away the residual mismatch."""
+    from scipy.spatial import cKDTree
+    if mask is not None:
+        def inside(points):
+            x, y = np.rint(points).astype(int).T
+            valid = (x >= 0) & (y >= 0) & (x < mask.shape[1]) & (y < mask.shape[0])
+            indexes = np.flatnonzero(valid)
+            valid[indexes] &= mask[y[indexes], x[indexes]]
+            return points[valid]
+        reference, moving = inside(reference), inside(moving)
+    if not len(reference) or not len(moving):
+        raise ValueError("No usable stellar centroids in common coverage.")
+    distance, indexes = cKDTree(reference).query(moving)
+    _, reverse = cKDTree(moving).query(reference)
+    keep = (distance <= max_distance) & (reverse[indexes] == np.arange(len(moving)))
+    positions = reference[indexes[keep]]
+    radius = np.linalg.norm((positions-(np.array(shape[::-1])-1)/2) /
+                            (np.array(shape[::-1])/2), axis=1)
+    residual = distance[keep]
+    stats = {"matched": len(residual), "reference": len(reference), "moving": len(moving),
+             "radius_limit": max_distance}
+    for name, region in (("all", np.ones(len(residual), bool)),
+                         ("centre", radius <= .5), ("outer", radius >= .75)):
+        values = residual[region]
+        stats[name] = {"count": len(values),
+                       "rms": float(np.sqrt(np.mean(values**2))) if len(values) else None,
+                       "p95": float(np.percentile(values, 95)) if len(values) else None}
+    return stats
+
+
+def report_residuals(label, stats, report):
+    report(f"{label}: {stats['matched']} mutual matches from {stats['moving']} moving / "
+           f"{stats['reference']} reference stars (search <= {stats['radius_limit']} px; "
+           "unmatched stars excluded).")
+    for region in ("all", "centre", "outer"):
+        entry = stats[region]
+        if entry['count'] >= 5:
+            report(f"  {region}: n={entry['count']}, RMS {entry['rms']:.3f} px, "
+                   f"95th percentile {entry['p95']:.3f} px")
+        else:
+            report(f"  {region}: insufficient matches ({entry['count']}); residual not reliable.")
+
+
+def validate_alignment(images, common, report, originals=None):
+    """Diagnostics only; no changes to science intensities or fitted output grid."""
+    try:
+        reference = stellar_centroids(images[0][0])
+        baseline_ref = stellar_centroids(originals[0][0]) if originals else None
+        for index in range(1, len(images)):
+            if originals:
+                try:
+                    import astroalign
+                    transform, _ = astroalign.find_transform(mono(originals[index][0]),
+                                                             mono(originals[0][0]),
+                                                             max_control_points=100)
+                    old = transform(stellar_centroids(originals[index][0]))
+                    report_residuals(f"Stack {index+1}, old similarity (centroids only)",
+                                     centroid_residuals(baseline_ref, old, originals[0][0].shape[-2:]), report)
+                except Exception as exc:
+                    report(f"Old similarity comparison unavailable for stack {index+1}: {exc}")
+            report_residuals(f"Stack {index+1}, output grid",
+                             centroid_residuals(reference, stellar_centroids(images[index][0]),
+                                                common.shape, common), report)
+        report("Centroid residuals measure position, not PSF/shape agreement. "
+               "Geometry cannot repair different star shapes or PSFs.")
+    except Exception as exc:
+        report(f"Stellar validation unavailable: {exc}. Inspect alignment manually; "
+               "no measured residual quality is claimed.")
+
+
+def align_sip(paths, options, report=lambda message: None):
+    """Native sequence solving and applyreg, independently undistorting all inputs."""
+    from astropy.io import fits
+    if len(paths) < 2 or options.solver not in ("siril", "astrometry.net", "existing"):
+        raise ValueError("Choose at least two stacks and a supported SIP solver.")
+    if not 2 <= options.order <= 5:
+        raise ValueError("SIP order must be between 2 and 5.")
+    if not Path(options.config).is_file():
+        raise ValueError("Choose your Siril 1.4 configuration file in SIP settings.")
+    originals = [read_stack(path) for path in paths]
+    if options.solver == "existing":
+        for path, (data, header) in zip(paths, originals):
+            try:
+                validate_sip(header, data.shape, options.order)
+            except Exception as exc:
+                raise ValueError(f"{Path(path).name}: invalid existing SIP solution: {exc}") from exc
+    with tempfile.TemporaryDirectory(prefix="siril-align-sip-") as temporary:
+        root = Path(temporary)
+        source, work = root/"inputs", root/"work"
+        source.mkdir(); work.mkdir()
+        config = configparser.RawConfigParser(strict=False)
+        config.read(options.config, encoding="utf-8")
+        if not config.has_section("core"):
+            raise ValueError("Not a Siril INI configuration file.")
+        config.set("core", "force_16bit", "false")
+        config.set("core", "extension", ".fit")
+        config.set("core", "wd", str(work))
+        config.set("core", "swap_dir", str(root))
+        if not config.has_section("astrometry"):
+            config.add_section("astrometry")
+        config.set("astrometry", "update_default_scale", "false")
+        config.set("astrometry", "sip_order", str(options.order))
+        config_path = root/"config.ini"
+        with config_path.open("w", encoding="utf-8") as stream:
+            config.write(stream, space_around_delimiters=False)
+        local = SIPOptions(options.executable, str(config_path), options.order,
+                           options.solver, options.timeout)
+        version = check_siril(local, work, report)
+        for i, (data, header) in enumerate(originals):
+            # Native sequences require a common channel count. Replicating mono
+            # into RGB is exact; it neither interpolates nor changes its values.
+            staged = data if data.ndim == 3 and data.shape[0] == 3 else \
+                np.repeat(mono(data)[None], 3, axis=0)
+            fits.PrimaryHDU(staged, header).writeto(source/f"input_{i:05d}.fit")
+        report("Creating private sequence copies; originals stay untouched.")
+        run_siril(local, source, ["convert stack -out=../work"], report)
+        solve = f"seqplatesolve stack -order={options.order} -nocache -nocrop"
+        if options.solver != "existing":
+            solve += " -force"
+        if options.solver == "astrometry.net":
+            solve += " -localasnet"
+        report("Recording independent SIP solutions and astrometric registration "
+               f"(order {options.order}, solver {options.solver}).")
+        run_siril(local, work, ["setref stack 1", solve], report)
+        solved_headers = []
+        for i, path in enumerate(paths):
+            staged = work/f"stack_{i+1:05d}.fit"
+            if not staged.is_file():
+                raise ValueError(f"Siril did not produce solved input {Path(path).name}.")
+            header = fits.getheader(staged)
+            try:
+                try:
+                    validate_sip(header, originals[i][0].shape, options.order)
+                except ValueError as exc:
+                    if options.solver == "existing" or not str(exc).startswith("SIP reverse polynomials differ"):
+                        raise
+                    report(f"{Path(path).name}: {exc}")
+                    header, error = refine_inverse_sip(header, originals[i][0].shape)
+                    report(f"Refined this stack's AP/BP inverse approximation to order 5: "
+                           f"maximum round-trip {error:.5f} px. Forward solve stays order {options.order}.")
+                    with fits.open(staged, mode="update") as hdus:
+                        hdus[0].header = header
+            except Exception as exc:
+                raise ValueError(f"{Path(path).name}: SIP solve rejected: {exc}. "
+                                 "No uncorrected fallback was used.") from exc
+            solved_headers.append(header)
+            report(f"{Path(path).name}: nonzero SIP order {options.order} verified, "
+                   "including full-field inverse round-trip.")
+        check_registration_file(work/"stack_.seq", len(paths))
+        apply = "seqapplyreg stack -interp=linear -framing=current -scale=1 -layer=1"
+        report("Undistorting ALL stacks, including reference, onto its common TAN grid.")
+        applied_log = run_siril(local, work, [apply+" -prefix=aligned_"], report)
+        if "undistortion will be applied" not in applied_log:
+            raise ValueError("Siril did not confirm applying distortion correction; batch rejected.")
+        outputs = [read_stack(work/f"aligned_stack_{i+1:05d}.fit") for i in range(len(paths))]
+        shape = outputs[0][0].shape[-2:]
+        if any(data.shape != (3, *shape) for data, _ in outputs):
+            raise ValueError("Native output dimensions or RGB channel counts differ.")
+        same_output_grid([header for _, header in outputs], shape)
+        # Transform geometric masks through the SAME native registration. Each
+        # science stack has already been resampled once; mask export doesn't touch it.
+        for i, ((data, _), header) in enumerate(zip(originals, solved_headers)):
+            fits.PrimaryHDU(np.ones((3, *data.shape[-2:]), np.float32), header).writeto(
+                work/f"stack_{i+1:05d}.fit", overwrite=True)
+        report("Computing shared valid coverage through the native distortion mappings.")
+        run_siril(local, work, [apply+" -prefix=coverage_"], lambda _: None)
+        common = np.ones(shape, bool)
+        for i in range(len(paths)):
+            mask, mask_header = read_stack(work/f"coverage_stack_{i+1:05d}.fit")
+            if mask.shape != (3, *shape):
+                raise ValueError("Coverage grid dimensions differ from science grid.")
+            same_output_grid([outputs[0][1], mask_header], shape)
+            common &= np.all(mask >= 1-1e-6, axis=0)
+        if not common.any():
+            raise ValueError("No shared coverage remains after distortion correction.")
+        images = []
+        grid_header = outputs[0][1]
+        for (output, _), (original, header) in zip(outputs, originals):
+            if original.ndim == 2:
+                output = output[0]
+            elif original.shape[0] == 1:
+                output = output[:1]
+            updated = output_header(header, grid_header, (0, 0, shape[1], shape[0]))
+            updated["ALNMODE"] = ("SIP", "Independent per-stack SIP undistortion applied")
+            updated["ALNORDER"] = options.order
+            updated["ALNSOLVE"] = options.solver
+            updated["ALNSIRIL"] = version
+            images.append((output, updated))
+        validate_alignment(images, common, report, originals)
+        report("STATUS: SIP correction applied; common undistorted grid verified. "
+               "No fallback. Science data resampled once; no photometric normalization.")
+        return images, common
 
 
 def read_stack(path):
@@ -96,8 +528,12 @@ def largest_rectangle(mask):
 
 def align(paths, report=lambda message: None):
     import astroalign
+    report("MODE: similarity star matching; distortion correction is OFF.")
     reference, ref_header = read_stack(paths[0])
     target = mono(reference)
+    for key in ("ALNORDER", "ALNSOLVE", "ALNSIRIL"):
+        ref_header.remove(key, ignore_missing=True)
+    ref_header["ALNMODE"] = "SIMILAR"
     images = [(reference, ref_header)]
     common = np.ones(target.shape, bool)
     for path in paths[1:]:
@@ -114,7 +550,11 @@ def align(paths, report=lambda message: None):
                f"scale {transform.scale:.6f}")
         output, valid = warp(data, transform.params, target.shape)
         common &= valid
+        header["ALNMODE"] = "SIMILAR"
+        for key in ("ALNORDER", "ALNSOLVE", "ALNSIRIL"):
+            header.remove(key, ignore_missing=True)
         images.append((output, header))
+    validate_alignment(images, common, report)
     return images, common
 
 
@@ -168,10 +608,21 @@ def main():
     except ImportError:
         s = None
     if s is not None:
-        for package in ("PyQt6", "astropy", "scipy", "astroalign"):
+        for package in ("PyQt6", "astropy", "scipy", "astroalign", "sep"):
             s.ensure_installed(package)
     from PyQt6 import QtCore, QtGui, QtWidgets as Q
     app = Q.QApplication.instance() or Q.QApplication(sys.argv)
+    configdir = None
+    if s is not None:
+        interface = s.SirilInterface()
+        try:
+            interface.connect()
+            configdir = interface.get_siril_configdir()
+        except Exception:
+            pass  # File picker still allows explicit configuration selection.
+        finally:
+            if interface.connected:
+                interface.disconnect()
 
     class Preview(Q.QGraphicsView):
         def __init__(self):
@@ -221,13 +672,18 @@ def main():
         result = QtCore.pyqtSignal(object)
         error = QtCore.pyqtSignal(str)
 
-        def __init__(self, paths):
+        def __init__(self, paths, options=None):
             super().__init__()
             self.paths = paths
+            self.options = options
 
         def run(self):
             try:
-                self.result.emit(align(self.paths, self.message.emit))
+                if self.options is None:
+                    result = align(self.paths, self.message.emit)
+                else:
+                    result = align_sip(self.paths, self.options, self.message.emit)
+                self.result.emit(result)
             except Exception as exc:
                 self.error.emit(str(exc))
 
@@ -256,6 +712,18 @@ def main():
             for button in (self.add, self.reference, self.run):
                 row.addWidget(button)
             layout.addLayout(row)
+            registration = Q.QHBoxLayout()
+            registration.addWidget(Q.QLabel("Alignment:"))
+            self.mode = Q.QComboBox()
+            self.mode.addItems(["Star matching (similarity)", "Astrometric + SIP distortion correction"])
+            registration.addWidget(self.mode)
+            self.settings_button = Q.QPushButton("SIP settings…")
+            self.settings_button.setEnabled(False)
+            registration.addWidget(self.settings_button)
+            layout.addLayout(registration)
+            self.sip_options = SIPOptions(find_siril_cli(), find_siril_config(configdir))
+            self.mode.currentIndexChanged.connect(self.change_mode)
+            self.settings_button.clicked.connect(self.sip_settings)
             self.preview = Preview()
             layout.addWidget(self.preview)
             layout.addWidget(Q.QLabel("Drag a rectangle for a custom shared crop. Preview stretch is display only."))
@@ -279,6 +747,58 @@ def main():
             self.auto.clicked.connect(lambda: self.preview.set_crop(self.auto_crop))
             self.save.clicked.connect(self.write)
             self.invalidate()
+
+        def change_mode(self, index):
+            self.settings_button.setEnabled(index == 1)
+            self.suffix.setText("_aligned_sip" if index == 1 else "_aligned")
+            self.invalidate()
+
+        def sip_settings(self):
+            dialog = Q.QDialog(self)
+            dialog.setWindowTitle("Independent SIP solving — Siril 1.4.4")
+            form = Q.QFormLayout(dialog)
+            order = Q.QSpinBox()
+            order.setRange(2, 5)
+            order.setValue(self.sip_options.order)
+            solver = Q.QComboBox()
+            solver.addItems(["Siril solver — fresh solve per stack",
+                             "Local Astrometry.net — fresh solve per stack",
+                             "Use each input's existing SIP solution"])
+            solvers = ["siril", "astrometry.net", "existing"]
+            solver.setCurrentIndex(solvers.index(self.sip_options.solver))
+            form.addRow("SIP polynomial order:", order)
+            form.addRow("Solutions:", solver)
+            fields = []
+            for title, value in (("Siril CLI executable:", self.sip_options.executable),
+                                 ("Siril 1.4 INI config:", self.sip_options.config)):
+                row = Q.QHBoxLayout()
+                field = Q.QLineEdit(value)
+                browse = Q.QPushButton("Browse…")
+                def choose(_, target=field):
+                    path, _ = Q.QFileDialog.getOpenFileName(dialog, "Choose file", target.text())
+                    if path:
+                        target.setText(path)
+                browse.clicked.connect(choose)
+                row.addWidget(field); row.addWidget(browse)
+                form.addRow(title, row)
+                fields.append(field)
+            note = Q.QLabel("Each input needs its own accurate coordinates and effective pixel scale "
+                            "in its FITS header. Fresh solves use Siril's configured catalogues "
+                            "or local Astrometry.net indices.\n"
+                            "No shared distortion master and no automatic uncorrected fallback. "
+                            "Existing solutions must contain nonzero SIP coefficients of the selected order. "
+                            "The reference will also be undistorted.")
+            note.setWordWrap(True)
+            form.addRow(note)
+            buttons = Q.QDialogButtonBox(Q.QDialogButtonBox.StandardButton.Ok |
+                                         Q.QDialogButtonBox.StandardButton.Cancel)
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            form.addRow(buttons)
+            if dialog.exec() == Q.QDialog.DialogCode.Accepted:
+                self.sip_options = SIPOptions(fields[0].text(), fields[1].text(),
+                                              order.value(), solvers[solver.currentIndex()])
+                self.invalidate()
 
         def invalidate(self):
             self.images = None
@@ -311,8 +831,9 @@ def main():
                 self.invalidate()
 
         def busy(self, value):
-            for widget in (self.files, self.add, self.reference, self.run):
+            for widget in (self.files, self.add, self.reference, self.run, self.mode):
                 widget.setEnabled(not value)
+            self.settings_button.setEnabled(not value and self.mode.currentIndex() == 1)
 
         def start(self):
             self.paths = [self.files.item(i).text() for i in range(self.files.count())]
@@ -322,7 +843,8 @@ def main():
             self.invalidate()
             self.busy(True)
             self.log.clear()
-            self.worker = Worker(self.paths)
+            options = self.sip_options if self.mode.currentIndex() == 1 else None
+            self.worker = Worker(self.paths, options)
             self.worker.message.connect(self.log.appendPlainText)
             self.worker.result.connect(self.ready)
             self.worker.error.connect(self.failed)
@@ -347,6 +869,7 @@ def main():
 
         def failed(self, message):
             self.invalidate()
+            self.log.appendPlainText("FAILED: " + message + "\nNo fallback outputs accepted.")
             Q.QMessageBox.critical(self, "Alignment failed", message)
 
         def write(self):

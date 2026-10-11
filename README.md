@@ -1,6 +1,6 @@
 # Siril scripts
 
-Custom and modified scripts for astronomical image processing with Siril: review exposures, preprocess and stack OSC data, align finished stacks, solve images with ASTAP, and stretch a stars layer.
+Custom and modified scripts for astronomical image processing with Siril: review exposures, preprocess and stack OSC data, align finished stacks, solve images with ASTAP, balance RGB/HaRGB colors, and stretch a stars layer.
 
 ## Python utilities
 
@@ -11,6 +11,7 @@ These utilities run from Siril's GUI with Python scripting support. Each linked 
 | [Align Stacks](python/Siril_Align_Stacks/) | Aligns a few RGB or mono FITS stacks using similarity matching or independent SIP astrometry (Siril 1.4.4); provides adaptive previews, shared cropping and centre/outer stellar residuals; saves `_aligned` or `_aligned_sip` copies. | Prepare RGB and narrowband stacks for continuum subtraction. SIP mode independently solves/undistorts every stack on a common grid, using a private temporary sequence and one science resampling. |
 | [ASTAP Plate Solve](python/Siril_ASTAP_PlateSolve/) | Solves the current FITS or TIFF image with ASTAP and imports the coordinate solution into Siril. | Add astrometry to an image for coordinate-aware processing. |
 | [Blink / Browse / Filter / Sort](python/Blink_Browse_Filter_Sort/) | Reviews sequences or image folders, compares image quality, recommends keepers, and sorts or filters frames. | Inspect exposures and choose frames before stacking. |
+| [SAS-style Star-Based White Balance](python/Siril_SAS_White_Balance/) | Ports SAS Pro star-based white balance with background neutralization, full-resolution star sampling, before/after preview, and undoable Apply. | Balance linear RGB or HaRGB before stretching; supports automatic or manual star-detection thresholds. |
 | [SAS-style Star Stretch](python/Siril_SAS_Star_Stretch/) | Stretches a stars-only mono or RGB image using SAS Pro Star Stretch mathematics, with colour boost, optional SCNR, and a preview. | Adjust a separated stars layer before recombining it with the starless image. |
 
 See [Siril's custom script installation instructions](https://siril.readthedocs.io/en/stable/scripts/Script-files.html#adding-custom-scripts-folders). Preserve each utility's license and attribution files when installing it.
@@ -36,4 +37,4 @@ Run these from the working directory containing the input subfolders used by the
 
 ## Attribution and licensing
 
-Some scripts are modified versions of community contributions. Preserve the copyright and license notices in each file; licenses are stated per script. The blink utility is based on Adrian Knagg-Baugh's GPL-3.0-or-later script. SAS-style Star Stretch is an unofficial GPL-3 adaptation of the SAS Pro transform; see its license and notice files. Stacking scripts retain their upstream attribution in their headers.
+Some scripts are modified versions of community contributions. Preserve the copyright and license notices in each file; licenses are stated per script. The blink utility is based on Adrian Knagg-Baugh's GPL-3.0-or-later script. SAS-style Star Stretch and Star-Based White Balance are unofficial GPL-3 ports of SAS Pro algorithms by Franklin Marek and contributors; see their license and notice files. Stacking scripts retain their upstream attribution in their headers.

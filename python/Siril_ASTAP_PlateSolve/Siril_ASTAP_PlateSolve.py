@@ -4,9 +4,9 @@ ASTAP plate-solving helper for Siril 1.4.
 
 This script exports the current Siril image to a temporary FITS, asks ASTAP to
 solve and update that FITS header, then imports the solved result back into the
-current Siril image. A scaled mono proxy is used only for solving; original
+current Siril image. Scaled mono and compact-star proxies are used only for solving; original
 pixels and non-astrometric metadata are preserved. FITS sources are overwritten
-in place; TIFF sources are saved as a sibling solved FITS file.
+in place; TIFF and JPEG sources are saved as a sibling solved FITS file.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import re
 import sys
 import time
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -28,13 +29,14 @@ s.ensure_installed("PyQt6")
 from PyQt6 import QtCore, QtWidgets
 
 
-VERSION = "0.3.0"
+VERSION = "0.5.0"
 ASTAP_TIMEOUT_SECONDS = 180
 WINDOW_TITLE = f"ASTAP Plate Solve for Siril {VERSION}"
 DEFAULT_RADIUS_DEG = 30
 DEFAULT_BLIND_RADIUS_DEG = 180
 FITS_SUFFIXES = {".fit", ".fits", ".fts"}
 TIFF_SUFFIXES = {".tif", ".tiff"}
+JPEG_SUFFIXES = {".jpg", ".jpeg"}
 DEFAULT_ASTAP_NAMES = (
     "astap",
     "astap_cli",
@@ -43,6 +45,14 @@ DEFAULT_ASTAP_NAMES = (
     "ASTAP",
     "ASTAP_CLI",
 )
+
+
+class SolveCancelled(InterruptedError):
+    """A user cancellation, handled without showing a failure dialog."""
+
+
+class AstapTimeout(RuntimeError):
+    """One search exhausted its budget; another strategy may still succeed."""
 
 
 def parse_key_value_text(text: str) -> dict[str, str]:
@@ -80,12 +90,42 @@ def prepare_solver_pixels(pixels: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(mono)
 
 
+def prepare_compact_star_pixels(
+    mono: np.ndarray, check_cancelled: Callable[[], None] = lambda: None,
+) -> np.ndarray | None:
+    """Isolate measured star peaks on the original grid for processed images."""
+    # Imported only on recovery, so normal solves need no extra dependency.
+    check_cancelled()
+    s.ensure_installed("scipy")
+    from scipy import ndimage
+
+    check_cancelled()
+    smooth = ndimage.gaussian_filter(mono, 1)
+    check_cancelled()
+    light = np.maximum(smooth - ndimage.gaussian_filter(mono, 10), 0)
+    check_cancelled()
+    peaks = ((light == ndimage.maximum_filter(light, 9))
+             & (light > np.percentile(light, 99)))
+    yy, xx = np.where(peaks)
+    strength = light[yy, xx]
+    order = np.argsort(strength)[-1500:]
+    if len(order) < 30:
+        return None
+    check_cancelled()
+    proxy = np.zeros_like(mono)
+    proxy[yy[order], xx[order]] = strength[order]
+    proxy = ndimage.gaussian_filter(proxy, 2)
+    check_cancelled()
+    return prepare_solver_pixels(proxy)
+
+
 _ASTROMETRY_KEY = re.compile(
     r"(?:WCSAXES|WCSNAME|CTYPE[12]|CUNIT[12]|CRPIX[12]|CRVAL[12]|"
     r"CDELT[12]|CROTA[12]|(?:CD|PC)[12]_[12]|PV[12]_\d+|"
     r"(?:A|B|AP|BP)_(?:ORDER|DMAX|\d+_\d+)|"
     r"LONPOLE|LATPOLE|RADESYS|RADECSYS|EQUINOX|PLTSOLVD|RA|DEC)"
 )
+_SIP_KEY = re.compile(r"(?:A|B|AP|BP)_(?:ORDER|DMAX|\d+_\d+)")
 
 
 def header_cards(header: str) -> list[str]:
@@ -103,6 +143,98 @@ def header_cards(header: str) -> list[str]:
         if card[:8].strip() == "END":
             break
     return result
+
+
+def prepare_solver_header(header: str) -> str:
+    """Prevent an undefined Siril equinox sentinel from corrupting the search."""
+    cards = header_cards(header)
+    for index, card in enumerate(cards):
+        if card[:8].strip() != "EQUINOX":
+            continue
+        try:
+            equinox = float(card[10:].split("/", 1)[0].replace("D", "E"))
+        except ValueError:
+            equinox = float("nan")
+        if not np.isfinite(equinox) or not 1000 <= equinox <= 3000:
+            cards[index] = "EQUINOX =               2000.0 / Undefined input equinox; use J2000".ljust(80)
+    return "\n".join(cards)
+
+
+def prepare_jpeg_solver_header(
+    path: Path, current_header: str, width: int, height: int,
+) -> tuple[str, str]:
+    """Use matching EXIF FITS cards as search hints, never as a final solution."""
+    s.ensure_installed("Pillow")
+    s.ensure_installed("astropy")
+    from PIL import Image
+    from astropy.io import fits
+    from astropy.io.fits.verify import VerifyError
+    from astropy.wcs import WCS
+
+    prefix = "JPEG EXIF: "
+    try:
+        with Image.open(path) as image:
+            exif = image.getexif()
+            description = exif.get(270)  # ImageDescription, used by Siril exports.
+            if description is None:
+                return current_header, prefix + "no embedded FITS header; solving from the loaded pixels."
+            if exif.get(274, 1) != 1:
+                return current_header, prefix + "rotated/mirrored orientation; ignoring embedded hints."
+            if image.size != (width, height):
+                return current_header, prefix + "loaded dimensions differ from the file; ignoring embedded hints."
+        if isinstance(description, bytes):
+            description = description.decode("ascii", errors="replace")
+        if not isinstance(description, str):
+            return current_header, prefix + "no readable FITS description; solving from the loaded pixels."
+        description = description.partition("\x00")[0].strip().replace("\r\n", "\n").replace("\r", "\n")
+        cards = header_cards(description)
+        if not cards or cards[0][:8].strip() != "SIMPLE" or cards[-1][:8].strip() != "END":
+            return current_header, prefix + "description is not a complete FITS header; ignoring it."
+        embedded_text = prepare_solver_header(description)
+        embedded = fits.Header.fromstring(embedded_text, sep="\n")
+        for card in embedded.cards:
+            card.verify("exception")
+        if (embedded.get("NAXIS1"), embedded.get("NAXIS2")) != (width, height):
+            return current_header, prefix + "embedded dimensions are stale; ignoring embedded hints."
+        # As in SPACER, reject an invalid coordinate grid. ASTAP still verifies
+        # the photographed stars, since dimension checks cannot detect all edits.
+        embedded_has_wcs = "CTYPE1" in embedded or "CTYPE2" in embedded
+        if embedded_has_wcs:
+            wcs = WCS(embedded, naxis=2)
+            scale = wcs.pixel_scale_matrix
+            if (not wcs.has_celestial or not np.isfinite(scale).all()
+                    or abs(np.linalg.det(scale)) < 1e-15
+                    or not np.isfinite(wcs.all_pix2world(
+                        [[0, 0], [width - 1, height - 1]], 0,
+                    )).all()):
+                return current_header, prefix + "invalid embedded WCS; ignoring embedded hints."
+        hint_keys = {"FOCALLEN", "XPIXSZ", "YPIXSZ", "XBINNING", "YBINNING", "OBJCTRA", "OBJCTDEC"}
+        # Treat WCS as one unit: mixing half a current solution with half an
+        # embedded one can create contradictory coordinate matrices.
+        current_cards = header_cards(current_header)
+        current_has_wcs = False
+        try:
+            current = WCS(fits.Header.fromstring(prepare_solver_header(current_header), sep="\n"), naxis=2)
+            current_has_wcs = (current.has_celestial and np.isfinite(current.pixel_scale_matrix).all()
+                               and abs(np.linalg.det(current.pixel_scale_matrix)) >= 1e-15
+                               and np.isfinite(current.all_pix2world([[0, 0], [width - 1, height - 1]], 0)).all())
+        except (ValueError, TypeError, VerifyError):
+            pass
+        if embedded_has_wcs and not current_has_wcs:
+            current_cards = [card for card in current_cards
+                             if not _ASTROMETRY_KEY.fullmatch(card[:8].strip())]
+        current_keys = {card[:8].strip() for card in current_cards}
+        hints = [card for card in header_cards(embedded_text)
+                 if (card[:8].strip() in hint_keys or
+                     (not current_has_wcs and _ASTROMETRY_KEY.fullmatch(card[:8].strip())))
+                 and card[:8].strip() not in current_keys]
+        if not hints:
+            return current_header, prefix + "no additional search hints; using Siril's current metadata."
+        result = "\n".join([card for card in current_cards if card[:8].strip() != "END"]
+                           + hints + ["END".ljust(80)])
+        return result, prefix + "using embedded astrometry/optics to guide a fresh ASTAP solve."
+    except (OSError, ValueError, TypeError, KeyError, VerifyError) as exc:
+        return current_header, prefix + f"could not use embedded metadata ({exc}); solving from the loaded pixels."
 
 
 def image_is_mirrored(header: str) -> bool:
@@ -135,6 +267,16 @@ def merge_astrometry(original: str, solved: str) -> str:
     """Copy only sky coordinates, never mono geometry or proxy intensity metadata."""
     solution = [card for card in header_cards(solved)
                 if _ASTROMETRY_KEY.fullmatch(card[:8].strip())]
+    # ASTAP's WCS sidecar includes input cards it did not update. Its new CD
+    # matrix must not compete with a stale PC matrix, and a TAN-only solution
+    # must not inherit old SIP coefficients when there were too few fit stars.
+    if any(re.fullmatch(r"CD[12]_[12]", card[:8].strip()) for card in solution):
+        solution = [card for card in solution
+                    if not re.fullmatch(r"PC[12]_[12]", card[:8].strip())]
+    has_sip = any(card[:8].strip() in {"CTYPE1", "CTYPE2"} and "-SIP" in card
+                  for card in solution)
+    if not has_sip:
+        solution = [card for card in solution if not _SIP_KEY.fullmatch(card[:8].strip())]
     keys = {card[:8].strip() for card in solution}
     if not {"CRPIX1", "CRPIX2", "CRVAL1", "CRVAL2", "CD1_1", "CD2_2"} <= keys:
         raise RuntimeError("ASTAP returned an incomplete WCS header.")
@@ -148,6 +290,10 @@ class AstapPlateSolveDialog(QtWidgets.QDialog):
     def __init__(self, siril: s.SirilInterface) -> None:
         super().__init__()
         self.siril = siril
+        self._busy = False
+        self._cancel_requested = False
+        self._committing = False
+        self._astap_process = None
         self.setWindowTitle(WINDOW_TITLE)
         self.setMinimumWidth(760)
 
@@ -173,11 +319,11 @@ class AstapPlateSolveDialog(QtWidgets.QDialog):
         path_label = QtWidgets.QLabel("ASTAP executable")
         self.path_edit = QtWidgets.QLineEdit()
         self.path_edit.setPlaceholderText("Path to astap / astap_cli executable")
-        browse_button = QtWidgets.QPushButton("Browse...")
-        browse_button.clicked.connect(self._browse_astap_executable)
+        self.browse_button = QtWidgets.QPushButton("Browse...")
+        self.browse_button.clicked.connect(self._browse_astap_executable)
         path_row.addWidget(path_label)
         path_row.addWidget(self.path_edit, 1)
-        path_row.addWidget(browse_button)
+        path_row.addWidget(self.browse_button)
         layout.addLayout(path_row)
 
         self.correct_mirror_check = QtWidgets.QCheckBox("Correct mirrored image if needed")
@@ -190,7 +336,13 @@ class AstapPlateSolveDialog(QtWidgets.QDialog):
 
         self.solve_button = QtWidgets.QPushButton("Solve")
         self.solve_button.clicked.connect(self._solve_current_image)
-        layout.addWidget(self.solve_button)
+        self.cancel_button = QtWidgets.QPushButton("Cancel")
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self._cancel_solve)
+        button_row = QtWidgets.QHBoxLayout()
+        button_row.addWidget(self.solve_button)
+        button_row.addWidget(self.cancel_button)
+        layout.addLayout(button_row)
 
         self.log_box = QtWidgets.QPlainTextEdit()
         self.log_box.setReadOnly(True)
@@ -242,14 +394,50 @@ class AstapPlateSolveDialog(QtWidgets.QDialog):
         QtWidgets.QApplication.processEvents()
 
     def _set_busy(self, busy: bool) -> None:
+        self._busy = busy
+        if busy:
+            self._cancel_requested = False
+        self._committing = False
         self.solve_button.setEnabled(not busy)
+        self.cancel_button.setText("Cancel")
+        self.cancel_button.setEnabled(busy)
         self.path_edit.setEnabled(not busy)
+        self.browse_button.setEnabled(not busy)
         self.correct_mirror_check.setEnabled(not busy)
         if busy:
             QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
         else:
             QtWidgets.QApplication.restoreOverrideCursor()
         QtWidgets.QApplication.processEvents()
+
+    def _cancel_solve(self) -> None:
+        if not self._busy or self._committing or self._cancel_requested:
+            return
+        self._cancel_requested = True
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.setText("Cancelling…")
+        self.log_box.appendPlainText("Cancellation requested; stopping ASTAP…")
+        if self._astap_process is not None:
+            self._astap_process.kill()
+
+    def _check_cancelled(self) -> None:
+        QtWidgets.QApplication.processEvents()
+        if self._cancel_requested:
+            raise SolveCancelled("Plate solving cancelled; no solution was applied or saved.")
+
+    def reject(self) -> None:
+        # Escape must not destroy a dialog while a nested solve is still running.
+        if self._busy:
+            self._cancel_solve()
+        else:
+            super().reject()
+
+    def closeEvent(self, event) -> None:
+        if self._busy:
+            self._cancel_solve()
+            event.ignore()
+        else:
+            super().closeEvent(event)
 
     def _resolve_astap_executable(self, raw_path: str) -> Path:
         cleaned = raw_path.strip().strip('"')
@@ -286,7 +474,9 @@ class AstapPlateSolveDialog(QtWidgets.QDialog):
         strategy_name: str,
         radius_deg: int,
         use_auto_fov: bool,
+        max_stars: int = 500,
     ) -> tuple[dict[str, str], str]:
+        self._check_cancelled()
         for sidecar in (".ini", ".wcs", ".log"):
             sidecar_path = input_path.with_suffix(sidecar)
             if sidecar_path.exists():
@@ -300,6 +490,8 @@ class AstapPlateSolveDialog(QtWidgets.QDialog):
             str(radius_deg),
             "-z",
             "0",
+            "-s",
+            str(max_stars),
             "-sip",
             "-wcs",
             "-progress",
@@ -309,13 +501,12 @@ class AstapPlateSolveDialog(QtWidgets.QDialog):
 
         self._append_log(f"Strategy: {strategy_name}")
         self._append_log(" ".join(command))
+        self._check_cancelled()
 
         started = time.monotonic()
         process = QtCore.QProcess(self)
+        self._astap_process = process
         process.setProcessChannelMode(QtCore.QProcess.ProcessChannelMode.MergedChannels)
-        process.start(command[0], command[1:])
-        if not process.waitForStarted(5000):
-            raise RuntimeError(f"Could not start ASTAP: {process.errorString()}")
         output_lines: list[str] = []
         pending = b""
 
@@ -333,13 +524,20 @@ class AstapPlateSolveDialog(QtWidgets.QDialog):
                 self._append_log(clean_line)
 
         try:
+            process.start(command[0], command[1:])
+            while not process.waitForStarted(50):
+                self._check_cancelled()
+                if (process.state() == QtCore.QProcess.ProcessState.NotRunning
+                        or time.monotonic() - started > 5):
+                    raise RuntimeError(f"Could not start ASTAP: {process.errorString()}")
             while process.state() != QtCore.QProcess.ProcessState.NotRunning:
                 process.waitForFinished(50)
                 drain_output()
-                QtWidgets.QApplication.processEvents()
+                self._check_cancelled()
                 if time.monotonic() - started > ASTAP_TIMEOUT_SECONDS:
-                    raise RuntimeError(f"ASTAP timed out after {ASTAP_TIMEOUT_SECONDS} seconds.")
+                    raise AstapTimeout(f"ASTAP timed out after {ASTAP_TIMEOUT_SECONDS} seconds.")
             drain_output(final=True)
+            self._check_cancelled()
             returncode = process.exitCode()
             if process.exitStatus() == QtCore.QProcess.ExitStatus.CrashExit:
                 raise RuntimeError("ASTAP crashed while solving the image.")
@@ -347,6 +545,7 @@ class AstapPlateSolveDialog(QtWidgets.QDialog):
             if process.state() != QtCore.QProcess.ProcessState.NotRunning:
                 process.kill()
                 process.waitForFinished(5000)
+            self._astap_process = None
             process.deleteLater()
         self._append_log(f"ASTAP elapsed time: {time.monotonic() - started:.1f} s")
 
@@ -358,10 +557,90 @@ class AstapPlateSolveDialog(QtWidgets.QDialog):
 
         if returncode not in (0, 1, 2, 16, 32, 33):
             raise RuntimeError(f"ASTAP exited with unexpected code {returncode}.")
+        if returncode in (16, 32, 33):
+            raise RuntimeError(ini_values.get("ERROR") or {
+                16: "ASTAP could not read the solver image.",
+                32: "ASTAP star database not found.",
+                33: "ASTAP could not read its star database.",
+            }[returncode])
+        if returncode in (1, 2):
+            ini_values.setdefault("ERROR", {
+                1: "No matching star pattern found.",
+                2: "Not enough stars detected.",
+            }[returncode])
 
         return ini_values, "\n".join(output_lines)
 
+    def _solve_with_strategies(
+        self, astap_path: Path, working_path: Path,
+        mono: np.ndarray, header: str, search_header: str | None = None,
+    ) -> tuple[dict[str, str], str]:
+        search_header = header if search_header is None else search_header
+        solver_header = prepare_solver_header(search_header)
+        if header_cards(solver_header) != header_cards(search_header):
+            self._append_log("Undefined/invalid EQUINOX in source metadata; using J2000 for the solver.")
+        # Change star detection before spending time widening the sky search.
+        attempts = (
+            ("Header-guided solve", DEFAULT_RADIUS_DEG, False, 500, False),
+            ("Header-guided solve with more stars", DEFAULT_RADIUS_DEG, False, 2000, False),
+            ("Processed-image recovery", DEFAULT_RADIUS_DEG, False, 500, True),
+            ("Wide search with header FOV", DEFAULT_BLIND_RADIUS_DEG, False, 500, False),
+            ("Processed-image wide search", DEFAULT_BLIND_RADIUS_DEG, False, 500, True),
+            ("Blind auto-FOV solve", DEFAULT_BLIND_RADIUS_DEG, True, 500, False),
+            ("Processed-image auto-FOV solve", DEFAULT_BLIND_RADIUS_DEG, True, 500, True),
+        )
+        compact = None
+        compact_prepared = False
+        insufficient_original_stars = False
+        error_message = "ASTAP did not return a solution."
+        for strategy_name, radius_deg, auto_fov, max_stars, use_compact in attempts:
+            self._check_cancelled()
+            if not use_compact and insufficient_original_stars:
+                continue
+            if use_compact and not compact_prepared:
+                self._append_log("Building a compact-star proxy for stretched/final images; original pixel grid is preserved.")
+                compact = prepare_compact_star_pixels(mono, self._check_cancelled)
+                compact_prepared = True
+                if compact is None:
+                    self._append_log("Too few distinct star peaks for processed-image recovery.")
+            if use_compact and compact is None:
+                continue
+            self._check_cancelled()
+            if not self.siril.save_image_file(
+                compact if use_compact else mono, solver_header, str(working_path),
+            ):
+                raise RuntimeError("Could not write the temporary solver image.")
+            try:
+                ini_values, _ = self._run_astap(
+                    astap_path, working_path, strategy_name, radius_deg, auto_fov, max_stars,
+                )
+            except AstapTimeout as exc:
+                error_message = str(exc)
+                self._append_log(f"{strategy_name}: {exc} Trying the next strategy.")
+                continue
+            self._check_cancelled()
+            if ini_values.get("PLTSOLVD", "").upper() == "T":
+                wcs_path = working_path.with_suffix(".wcs")
+                if not wcs_path.exists():
+                    raise RuntimeError("ASTAP did not produce a WCS header.")
+                solved_header = wcs_path.read_text(encoding="ascii")
+                self._append_log(f"Successful strategy: {strategy_name}")
+                return ini_values, merge_astrometry(header, solved_header)
+            error_message = ini_values.get("ERROR", "ASTAP did not return a solution.")
+            warning_message = ini_values.get("WARNING", "")
+            self._append_log(f"{strategy_name} failed: {error_message}")
+            if warning_message:
+                self._append_log(f"{strategy_name} warning: {warning_message}")
+                error_message += f"\nWarning: {warning_message}"
+            if (not use_compact and
+                    ("not enough stars" in error_message.lower() or "no stars" in error_message.lower())):
+                insufficient_original_stars = True
+                self._append_log("Trying processed-image recovery; wider searches alone cannot improve star detection.")
+        raise RuntimeError(error_message)
+
     def _solve_current_image(self) -> None:
+        if self._busy:
+            return
         self._refresh_loaded_image_label()
         self.log_box.clear()
 
@@ -382,19 +661,21 @@ class AstapPlateSolveDialog(QtWidgets.QDialog):
         self._set_busy(True)
 
         try:
+            self._check_cancelled()
             current_name = self.siril.get_image_filename()
             if not current_name:
-                raise RuntimeError("The current image must be associated with a FITS or TIFF file.")
+                raise RuntimeError("The current image must be associated with a FITS, TIFF or JPEG file.")
 
             original_path = Path(current_name)
             source_suffix = original_path.suffix.lower()
             if source_suffix in FITS_SUFFIXES:
                 output_path = original_path
-            elif source_suffix in TIFF_SUFFIXES:
+            elif source_suffix in TIFF_SUFFIXES | JPEG_SUFFIXES:
                 output_path = original_path.with_name(f"{original_path.stem}_astap_solved.fit")
-                self._append_log(f"TIFF source detected. Solved result will be saved as FITS: {output_path}")
+                source_format = "JPEG" if source_suffix in JPEG_SUFFIXES else "TIFF"
+                self._append_log(f"{source_format} source detected. Solved result will be saved as FITS: {output_path}")
             else:
-                raise RuntimeError("This script currently supports FITS and TIFF sources only.")
+                raise RuntimeError("This script currently supports FITS, TIFF and JPEG sources only.")
 
             pixeldata = self.siril.get_image_pixeldata()
             if pixeldata is None:
@@ -404,56 +685,29 @@ class AstapPlateSolveDialog(QtWidgets.QDialog):
                 raise RuntimeError("Could not read the FITS header from the current Siril image.")
 
             original_pixels = np.ascontiguousarray(pixeldata)
+            search_header = header
+            if source_suffix in JPEG_SUFFIXES:
+                self._check_cancelled()
+                search_header, message = prepare_jpeg_solver_header(
+                    original_path, header, original_pixels.shape[-1], original_pixels.shape[-2],
+                )
+                self._append_log(message)
             working_pixels = prepare_solver_pixels(original_pixels)
+            self._check_cancelled()
             self._append_log("Solving a same-size monochrome proxy scaled to 0–65535; original pixels are preserved.")
 
             with tempfile.TemporaryDirectory(prefix="siril_astap_") as tmpdir_name:
                 working_path = Path(tmpdir_name) / "astap_work.fit"
 
-                def solve_with_strategies(strategy_pixels: np.ndarray) -> tuple[dict[str, str], str]:
-                    if not self.siril.save_image_file(strategy_pixels, header, str(working_path)):
-                        raise RuntimeError("Could not write the temporary solver image.")
-                    self._append_log(f"Working FITS written to {working_path}")
+                ini_values, solved_header = self._solve_with_strategies(
+                    astap_path, working_path, working_pixels, header, search_header,
+                )
 
-                    attempts = (
-                        ("Header-guided solve", DEFAULT_RADIUS_DEG, False),
-                        ("Wide search with header FOV", DEFAULT_BLIND_RADIUS_DEG, False),
-                        ("Blind auto-FOV solve", DEFAULT_BLIND_RADIUS_DEG, True),
-                    )
-                    latest_ini: dict[str, str] | None = None
-
-                    for strategy_name, radius_deg, use_auto_fov in attempts:
-                        latest_ini, _ = self._run_astap(
-                            astap_path,
-                            working_path,
-                            strategy_name,
-                            radius_deg,
-                            use_auto_fov,
-                        )
-                        if latest_ini.get("PLTSOLVD", "").upper() == "T":
-                            wcs_path = working_path.with_suffix(".wcs")
-                            if not wcs_path.exists():
-                                raise RuntimeError("ASTAP did not produce a WCS header.")
-                            solved_header = wcs_path.read_text(encoding="ascii")
-                            return latest_ini, merge_astrometry(header, solved_header)
-
-                        error_message = latest_ini.get("ERROR", "ASTAP did not return a solution.")
-                        warning_message = latest_ini.get("WARNING", "")
-                        self._append_log(f"{strategy_name} failed: {error_message}")
-                        if warning_message:
-                            self._append_log(f"{strategy_name} warning: {warning_message}")
-                        if "not enough stars" in error_message.lower() or "no stars" in error_message.lower():
-                            self._append_log("Stopping: a wider sky search cannot fix insufficient star detection.")
-                            break
-
-                    assert latest_ini is not None
-                    error_message = latest_ini.get("ERROR", "ASTAP did not return a solution.")
-                    warning_message = latest_ini.get("WARNING", "")
-                    full_message = error_message if not warning_message else f"{error_message}\nWarning: {warning_message}"
-                    raise RuntimeError(full_message)
-
-                ini_values, solved_header = solve_with_strategies(working_pixels)
-
+                self._check_cancelled()
+                # Applying WCS, mirroring and saving form one final operation.
+                # A late cancellation must not leave a half-applied solution.
+                self._committing = True
+                self.cancel_button.setEnabled(False)
                 with self.siril.image_lock():
                     self.siril.undo_save_state("ASTAP plate solve")
                     self.siril.set_image_metadata_from_header_string(solved_header)
@@ -508,9 +762,9 @@ class AstapPlateSolveDialog(QtWidgets.QDialog):
             if warning_message:
                 self._append_log(f"ASTAP warning: {warning_message}")
 
-            if source_suffix in TIFF_SUFFIXES:
+            if source_suffix in TIFF_SUFFIXES | JPEG_SUFFIXES:
                 completion_message = (
-                    f"ASTAP solved the TIFF image via temporary FITS and saved the result as:\n{output_path}"
+                    f"ASTAP solved the {source_format} image via temporary FITS and saved the result as:\n{output_path}"
                 )
             else:
                 completion_message = f"ASTAP solved and updated:\n{output_path}"
@@ -520,6 +774,8 @@ class AstapPlateSolveDialog(QtWidgets.QDialog):
                 "Plate solve complete",
                 completion_message,
             )
+        except SolveCancelled as exc:
+            self._append_log(str(exc))
         except ProcessingThreadBusyError as exc:
             QtWidgets.QMessageBox.warning(
                 self,

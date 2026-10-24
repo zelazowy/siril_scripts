@@ -1,10 +1,25 @@
-# ASTAP Plate Solve for Siril (v0.5.0)
+# Plate Solve for Siril (v0.6.0)
 
 Run `Siril_ASTAP_PlateSolve.py` from Siril's GUI with a single FITS, TIFF or JPEG (`.jpg`/`.jpeg`) image loaded. Install [ASTAP](https://www.hnsky.org/astap.htm) and [add this script to Siril](https://siril.readthedocs.io/en/latest/scripts/Script-files.html#adding-custom-scripts-folders). Select your installed ASTAP executable or application bundle, then click **Solve**. An ASTAP star database must be installed. The script uses NumPy, sirilpy and PyQt6; processed-image recovery also uses SciPy. JPEG metadata reading uses Pillow and Astropy. Extra dependencies are installed through sirilpy when first needed.
 
+The implementation now imports [astro-platesolve](../../shared/astro-platesolve/),
+the same library used by Align Stacks and SPACER. Install it first with Siril's
+Python: `python -m pip install -e /path/to/siril_scripts/shared/astro-platesolve`.
+Use that same editable source directory in every application environment so solver
+updates happen in one place. The library is not yet published on PyPI.
+
+ASTAP remains the default backend. The central configuration can select Skyshot
+for all three tools; this window's executable field is the ASTAP fallback. See the
+shared library guide for configuration. Skyshot's CLI schema and rejection paths
+are tested with simulated results, but a real executable/index is not installed
+or benchmarked here. Local-grid corrections absent from FITS WCS are rejected.
+The historical script filename and `_astap_solved.fit` suffix remain for compatibility;
+the log reports the actual backend. Siril image undo/import/mirror/save policies stay
+in this adapter; engine commands/recovery/validation/cancellation live in the library.
+
 Siril exports can store FITS/WCS cards in the JPEG's EXIF `ImageDescription` tag, which SPACER also reads. The script uses these as coordinates and scale hints for a fresh ASTAP solve. It checks that the embedded dimensions, file dimensions and current loaded dimensions agree, that EXIF orientation is unrotated, and that any embedded WCS is valid. A complete current Siril WCS takes priority over an embedded one. Ordinary camera GPS EXIF is not a sky-coordinate solution. Missing, stale, rotated or malformed embedded metadata is ignored and solving continues from the loaded pixels. Even matching dimensions cannot prove that an image was never edited, so embedded astrometry is always checked by solving the stars again.
 
-The script first tries a monochrome copy with the normal star sample, then a larger star sample. If those fail, it automatically tries a compact-star copy: it suppresses the stretched background, isolates measured stellar peaks, and places compact profiles at those same pixel positions. This helps with nonlinear, stretched final images. All solver copies retain the original dimensions and coordinate grid. Wider sky searches and automatic field-of-view searches remain available as fallbacks. Recovery cannot guarantee a solution if processing has removed too many stars or distorted their positions.
+The script first tries a monochrome copy with the normal star sample, then a larger star sample. If those fail, it automatically tries a compact-star copy: it suppresses the stretched background, isolates measured stellar peaks, and places compact profiles at those same pixel positions. This helps with nonlinear, stretched final images. All solver copies retain the original dimensions and coordinate grid. Header-guided and wider automatic field-of-view searches are handled by the shared backend. Recovery cannot guarantee a solution if processing has removed too many stars or distorted their positions.
 
 An undefined or clearly invalid `EQUINOX` value is replaced with J2000 in the temporary solver header. Valid equinox values are preserved. Only the resulting astrometry is imported; the solver's monochrome pixels and intensity metadata never replace the original image. Old PC matrices and unused SIP coefficients carried through ASTAP's output are excluded when importing its new CD/TAN solution.
 

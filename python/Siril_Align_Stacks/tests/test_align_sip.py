@@ -9,7 +9,8 @@ from astropy.io import fits
 from astropy.wcs import WCS, Sip
 from Siril_Align_Stacks import (validate_sip, refine_inverse_sip, same_output_grid,
     run_siril, SIPOptions, align_sip, centroid_residuals, stellar_centroids,
-    largest_rectangle, save_outputs)
+    largest_rectangle, save_outputs, canonical_sip_header, astap_solution_header,
+    solve_astap_stack)
 
 
 def solution(coeff=5e-7):
@@ -25,6 +26,38 @@ def solution(coeff=5e-7):
 
 
 class SIPTests(unittest.TestCase):
+    def test_astap_lower_terms_preserve_world_mapping(self):
+        w = solution()
+        a, b = w.sip.a.copy(), w.sip.b.copy()
+        a[0, 0], a[1, 0], b[0, 0], b[0, 1] = .12, .001, -.08, -.002
+        w.sip = Sip(a, b, None, None, w.wcs.crpix)
+        header, changed = canonical_sip_header(w.to_header(relax=True), (256, 256))
+        self.assertTrue(changed)
+        validate_sip(header, (256, 256), 3)
+        points = np.array([[0., 0.], [200., 110.], [255., 255.]])
+        np.testing.assert_allclose(WCS(header).all_pix2world(points, 0),
+                                   w.all_pix2world(points, 0), atol=1e-9)
+
+    def test_astap_linear_solution_cannot_inherit_input_sip(self):
+        old = solution().to_header(relax=True)
+        linear = solution(); linear.sip = None
+        linear.wcs.ctype = ['RA---TAN', 'DEC--TAN']
+        with self.assertRaisesRegex(ValueError, 'linear WCS'):
+            astap_solution_header(old, linear.to_header(), (256, 256))
+
+    def test_shared_solver_transfers_only_verified_astrometry(self):
+        from astro_platesolve import SolveResult
+        data=np.arange(256*256,dtype=np.float32).reshape(256,256)/10000
+        before=data.copy();header=solution().to_header(relax=True);header['EXPTIME']=123.
+        with tempfile.TemporaryDirectory() as folder:
+            with patch('astro_platesolve.solve_image',return_value=SolveResult(solution().to_header(relax=True),'test')) as run:
+                accepted=solve_astap_stack(data,header,SIPOptions(),Path(folder)/'solver.fit',lambda _:None)
+        self.assertTrue(run.call_args.args[2].require_sip)
+        validate_sip(accepted,data.shape,3)
+        self.assertEqual(accepted['EXPTIME'],123.)
+        self.assertEqual(accepted['ALNBACK'],'test')
+        np.testing.assert_array_equal(data,before)
+
     def test_reject_linear_forward_only_and_wrong_order(self):
         header = solution().to_header(relax=True)
         validate_sip(header, (256, 256), 3)
@@ -76,15 +109,18 @@ class SIPTests(unittest.TestCase):
             paths = [Path(folder)/'rgb.fit', Path(folder)/'mono.fit']
             originals = []
             for i, coeff in enumerate((3e-6, -1e-6)):
-                w = solution(coeff); pixels = w.all_world2pix(sky, 0)
+                w = solution(coeff)
+                if i == 0:
+                    a, b = w.sip.a.copy(), w.sip.b.copy()
+                    a[0, 0], a[1, 0], b[0, 0], b[0, 1] = .12, .001, -.08, -.002
+                    w.sip = Sip(a, b, -a, -b, w.wcs.crpix)
+                pixels = w.all_world2pix(sky, 0)
                 data = np.full((256, 256), .02, np.float32)
                 for j, (x, y) in enumerate(pixels):
                     data += (.1+.01*(j % 10))*np.exp(-((xx-x)**2+(yy-y)**2)/4)
                 data += rng.normal(0, .00002, data.shape).astype(np.float32)
                 if i == 0: data = np.stack([data, data*1.2, data*.8])
                 header = w.to_header(relax=True)
-                if i == 0:
-                    header, _ = refine_inverse_sip(header, data.shape)
                 fits.writeto(paths[i], data, header)
                 originals.append(data.copy())
             options = SIPOptions(os.environ['SIRIL_TEST_CLI'],

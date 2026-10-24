@@ -8,13 +8,22 @@ These utilities run from Siril's GUI with Python scripting support. Each linked 
 
 | Script | What it does | Typical use |
 | --- | --- | --- |
-| [Align Stacks](python/Siril_Align_Stacks/) | Aligns a few RGB or mono FITS stacks using similarity matching or independent SIP astrometry (Siril 1.4.4); provides adaptive previews, shared cropping and centre/outer stellar residuals; saves `_aligned` or `_aligned_sip` copies. | Prepare RGB and narrowband stacks for continuum subtraction. SIP mode independently solves/undistorts every stack on a common grid, using a private temporary sequence and one science resampling. |
-| [ASTAP Plate Solve](python/Siril_ASTAP_PlateSolve/) | Solves the current FITS, TIFF or JPEG image with ASTAP and imports the coordinate solution into Siril; uses matching JPEG EXIF FITS/WCS as search hints, tries compact-star recovery for stretched/final images, and corrects undefined equinox metadata. | Add astrometry while preserving loaded pixels; cancel an active solve from the script window. TIFF/JPEG results are saved as sibling `_astap_solved.fit` files. See the [guide](python/Siril_ASTAP_PlateSolve/README.md) for requirements and controls. |
+| [Align Stacks](python/Siril_Align_Stacks/) | Aligns a few RGB or mono FITS stacks using similarity matching or independent SIP astrometry (Siril 1.4.4), with shared solver recovery and support for existing ASTAP SIP solutions; provides adaptive previews, shared cropping and centre/outer stellar residuals; saves `_aligned` or `_aligned_sip` copies. | Prepare RGB and narrowband stacks for continuum subtraction. SIP mode independently solves/undistorts every stack on a common grid, using a private temporary sequence and one science resampling. |
+| [Plate Solve (ASTAP/shared)](python/Siril_ASTAP_PlateSolve/) | Uses the common `astro-platesolve` library (ASTAP default, configurable backend) to solve the current FITS, TIFF or JPEG image with ASTAP and imports the coordinate solution into Siril; uses matching JPEG EXIF FITS/WCS as search hints, tries compact-star recovery for stretched/final images, and corrects undefined equinox metadata. | Add astrometry while preserving loaded pixels; cancel an active solve from the script window. TIFF/JPEG results are saved as sibling `_astap_solved.fit` files. See the [guide](python/Siril_ASTAP_PlateSolve/README.md) for requirements and controls. |
 | [Blink / Browse / Filter / Sort](python/Blink_Browse_Filter_Sort/) | Reviews sequences or image folders, compares image quality, recommends keepers, and sorts or filters frames. | Inspect exposures and choose frames before stacking. |
 | [SAS-style Star-Based White Balance](python/Siril_SAS_White_Balance/) | Ports SAS Pro star-based white balance with background neutralization, full-resolution star sampling, before/after preview, and undoable Apply. | Balance linear RGB or HaRGB before stretching; supports automatic or manual star-detection thresholds. |
 | [SAS-style Star Stretch](python/Siril_SAS_Star_Stretch/) | Stretches a stars-only mono or RGB image using SAS Pro Star Stretch mathematics, with colour boost, optional SCNR, and a preview. | Adjust a separated stars layer before recombining it with the starless image. |
 
 See [Siril's custom script installation instructions](https://siril.readthedocs.io/en/stable/scripts/Script-files.html#adding-custom-scripts-folders). Preserve each utility's license and attribution files when installing it.
+
+## Shared plate-solving library
+
+[astro-platesolve](shared/astro-platesolve/) is the single implementation imported by
+Plate Solve, Align Stacks and SPACER. It owns engine adapters, recovery, proxies,
+validation, logs and cancellation. Install it once per Python environment; editable
+installs can point to one checkout. A central configuration selects ASTAP or the
+Skyshot CLI adapter without replacing code in the applications. Skyshot runtime
+accuracy/speed is not yet tested here; see its adapter limits in the library guide.
 
 ## OSC preprocessing and stacking
 

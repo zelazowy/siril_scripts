@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-VERSION = "1.1.0"
+VERSION = "1.3.0"
 
 
 @dataclass
@@ -23,8 +23,9 @@ class SIPOptions:
     executable: str = ""
     config: str = ""
     order: int = 3
-    solver: str = "siril"  # siril, astrometry.net, existing
+    solver: str = "siril"  # siril, astrometry.net, existing, astap
     timeout: int = 900
+    astap_executable: str = ""
 
 
 def find_siril_cli():
@@ -44,6 +45,114 @@ def find_siril_config(configdir=None):
     return next((str(root/name) for root in roots
                  for name in ("config.1.4.ini", "config.ini")
                  if (root/name).is_file()), "")
+
+
+def find_astap():
+    try:
+        from astro_platesolve.astap import find_astap as discover
+        return discover()
+    except ImportError:
+        return ""
+
+
+def canonical_sip_header(header, shape):
+    """Absorb ASTAP's constant/linear SIP terms into CRPIX/CD without changing WCS.
+
+    Normalize into the strict degree >=2 form accepted by our validator. Keep
+    the full mapping by shifting the polynomial origin and factoring its
+    Jacobian into CD; never discard these lower-order terms.
+    """
+    from astropy.wcs import WCS, Sip
+    from scipy.optimize import root
+    from math import comb
+    old = WCS(header, naxis=2)
+    if old.sip is None:
+        raise ValueError("No SIP distortion model to canonicalize.")
+    a, b = old.sip.a.copy(), old.sip.b.copy()
+    if not any(abs(poly[i, j]) > 0 for poly in (a, b)
+               for i, j in ((0, 0), (1, 0), (0, 1))):
+        return header.copy(), False
+    f, g = a.copy(), b.copy()
+    f[1, 0] += 1; g[0, 1] += 1
+    def evaluate(point):
+        return [np.polynomial.polynomial.polyval2d(*point, p) for p in (f, g)]
+    solved = root(evaluate, [0., 0.])
+    if not solved.success or np.max(np.abs(evaluate(solved.x))) > 1e-7:
+        raise ValueError("Cannot canonicalize SIP polynomial origin.")
+    def shifted(poly):
+        out = np.zeros_like(poly)
+        for i, j in np.ndindex(poly.shape):
+            for k in range(i+1):
+                for l in range(j+1):
+                    out[k, l] += poly[i, j]*comb(i, k)*comb(j, l)*solved.x[0]**(i-k)*solved.x[1]**(j-l)
+        return out
+    f, g = shifted(f), shifted(g)
+    jacobian = np.array([[f[1, 0], f[0, 1]], [g[1, 0], g[0, 1]]])
+    if not np.isfinite(jacobian).all() or abs(np.linalg.det(jacobian)) < 1e-10:
+        raise ValueError("Singular SIP linear component.")
+    a, b = np.einsum('ab,bij->aij', np.linalg.inv(jacobian), np.stack([f, g]))
+    for poly in (a, b):
+        poly[0, 0] = poly[1, 0] = poly[0, 1] = 0
+    new = old.deepcopy()
+    if new.wcs.has_pc():
+        del new.wcs.pc
+    new.wcs.cd = old.pixel_scale_matrix @ jacobian
+    new.wcs.crpix = old.wcs.crpix+solved.x
+    new.sip = Sip(a, b, None, None, new.wcs.crpix)
+    h, w = shape[-2:]
+    xx, yy = np.meshgrid(np.linspace(0, w-1, 11), np.linspace(0, h-1, 11))
+    points = np.column_stack((xx.ravel(), yy.ravel()))
+    back = old.all_world2pix(new.all_pix2world(points, 0), 0, tolerance=1e-6, maxiter=100)
+    if not np.isfinite(back).all() or np.max(np.linalg.norm(back-points, axis=1)) > 1e-4:
+        raise ValueError("Canonical SIP does not preserve the original coordinate mapping.")
+    result = output_header(header, new.to_header(relax=True), (0, 0, w, h))
+    result, _ = refine_inverse_sip(result, shape)
+    return result, True
+
+
+def astap_solution_header(original, solved, shape, order=3):
+    """Import only NEW astrometry: never retain old SIP from a failed fit."""
+    from astropy.wcs import WCS
+    if not all(str(solved.get(f"CTYPE{i}", "")).endswith("-SIP") for i in (1, 2)):
+        raise ValueError("ASTAP solved only linear WCS; distortion correction rejected.")
+    if solved.get("A_ORDER") != order or solved.get("B_ORDER") != order:
+        raise ValueError(f"Shared solver did not return the requested order-{order} SIP model; "
+                         f"got {solved.get('A_ORDER')}/{solved.get('B_ORDER')}. "
+                         "ASTAP supports order 3; other engines may choose a different order.")
+    # ASTAP sidecars can echo an old PC matrix alongside the newly solved CD.
+    solved = solved.copy()
+    if any(re.fullmatch(r"CD[12]_[12]", k) for k in solved):
+        for key in list(solved):
+            if re.fullmatch(r"PC[12]_[12]|CDELT[12]|CROTA[12]", key):
+                del solved[key]
+    clean = original.copy()
+    for key in list(clean):
+        if key in ("PLTSOLVD", "RA", "DEC"):
+            del clean[key]
+    header = output_header(clean, solved, (0, 0, shape[-1], shape[-2]))
+    header, _ = canonical_sip_header(header, shape)
+    # Construct inverse evaluation from the independently solved A/B model.
+    header, error = refine_inverse_sip(header, shape)
+    wcs = WCS(header, naxis=2)
+    world = wcs.all_pix2world([[shape[-1]/2, shape[-2]/2]], 0)[0]
+    header['RA'], header['DEC'], header['PLTSOLVD'] = float(world[0]), float(world[1]), True
+    return header, error
+
+
+def solve_astap_stack(data, header, options, path, report):
+    """Shared solver returns only WCS; registration-specific SIP checks stay here."""
+    try:
+        from astro_platesolve import SolveOptions, solve_image
+    except ImportError as exc:
+        raise RuntimeError("Install the shared astro-platesolve library in this Python environment; see README.") from exc
+    result = solve_image(data, header, SolveOptions(
+        executable=options.astap_executable, timeout=options.timeout,
+        require_sip=True, log_path=str(path.with_suffix('.log'))), report)
+    report(f"Shared solver backend: {result.backend}; strategy: {result.strategy}")
+    accepted, error = astap_solution_header(header, result.header, data.shape, options.order)
+    accepted['ALNBACK'] = result.backend
+    report(f"Independent SIP verified; inverse maximum error {error:.5f} px. Science pixels unchanged.")
+    return accepted
 
 
 def run_siril(options, directory, commands, report=lambda message: None):
@@ -323,7 +432,7 @@ def validate_alignment(images, common, report, originals=None):
 def align_sip(paths, options, report=lambda message: None):
     """Native sequence solving and applyreg, independently undistorting all inputs."""
     from astropy.io import fits
-    if len(paths) < 2 or options.solver not in ("siril", "astrometry.net", "existing"):
+    if len(paths) < 2 or options.solver not in ("siril", "astrometry.net", "existing", "astap"):
         raise ValueError("Choose at least two stacks and a supported SIP solver.")
     if not 2 <= options.order <= 5:
         raise ValueError("SIP order must be between 2 and 5.")
@@ -331,8 +440,13 @@ def align_sip(paths, options, report=lambda message: None):
         raise ValueError("Choose your Siril 1.4 configuration file in SIP settings.")
     originals = [read_stack(path) for path in paths]
     if options.solver == "existing":
-        for path, (data, header) in zip(paths, originals):
+        for index, (path, (data, header)) in enumerate(zip(paths, originals)):
             try:
+                header, changed = canonical_sip_header(header, data.shape)
+                if changed:
+                    report(f"{Path(path).name}: absorbed ASTAP constant/linear SIP terms into CRPIX/CD; "
+                           "coordinate mapping preserved, inverse revalidated.")
+                    originals[index] = (data, header)
                 validate_sip(header, data.shape, options.order)
             except Exception as exc:
                 raise ValueError(f"{Path(path).name}: invalid existing SIP solution: {exc}") from exc
@@ -358,16 +472,21 @@ def align_sip(paths, options, report=lambda message: None):
         local = SIPOptions(options.executable, str(config_path), options.order,
                            options.solver, options.timeout)
         version = check_siril(local, work, report)
+        shared_backends = []
         for i, (data, header) in enumerate(originals):
             # Native sequences require a common channel count. Replicating mono
             # into RGB is exact; it neither interpolates nor changes its values.
             staged = data if data.ndim == 3 and data.shape[0] == 3 else \
                 np.repeat(mono(data)[None], 3, axis=0)
+            if options.solver == "astap":
+                report(f"Solving independently with ASTAP: {Path(paths[i]).name}")
+                header = solve_astap_stack(data, header, options, root/f"solver_{i:05d}.fit", report)
+            shared_backends.append(header.get('ALNBACK', options.solver))
             fits.PrimaryHDU(staged, header).writeto(source/f"input_{i:05d}.fit")
         report("Creating private sequence copies; originals stay untouched.")
         run_siril(local, source, ["convert stack -out=../work"], report)
         solve = f"seqplatesolve stack -order={options.order} -nocache -nocrop"
-        if options.solver != "existing":
+        if options.solver not in ("existing", "astap"):
             solve += " -force"
         if options.solver == "astrometry.net":
             solve += " -localasnet"
@@ -427,7 +546,7 @@ def align_sip(paths, options, report=lambda message: None):
             raise ValueError("No shared coverage remains after distortion correction.")
         images = []
         grid_header = outputs[0][1]
-        for (output, _), (original, header) in zip(outputs, originals):
+        for (output, _), (original, header), backend in zip(outputs, originals, shared_backends):
             if original.ndim == 2:
                 output = output[0]
             elif original.shape[0] == 1:
@@ -435,7 +554,7 @@ def align_sip(paths, options, report=lambda message: None):
             updated = output_header(header, grid_header, (0, 0, shape[1], shape[0]))
             updated["ALNMODE"] = ("SIP", "Independent per-stack SIP undistortion applied")
             updated["ALNORDER"] = options.order
-            updated["ALNSOLVE"] = options.solver
+            updated["ALNSOLVE"] = backend
             updated["ALNSIRIL"] = version
             images.append((output, updated))
         validate_alignment(images, common, report, originals)
@@ -565,7 +684,7 @@ def output_header(original, reference, crop):
     pattern = re.compile(r"^(WCSAXES|CTYPE\d+[A-Z]?|CUNIT\d+[A-Z]?|CRPIX\d+[A-Z]?|"
                          r"CRVAL\d+[A-Z]?|CDELT\d+[A-Z]?|CROTA\d+[A-Z]?|"
                          r"(?:CD|PC|PV|PS)\d+_\d+[A-Z]?|LONPOLE[A-Z]?|LATPOLE[A-Z]?|"
-                         r"RADESYS[A-Z]?|EQUINOX[A-Z]?|[AB]P?_ORDER|[AB]P?_\d+_\d+)$")
+                         r"RADESYS[A-Z]?|EQUINOX[A-Z]?|[AB]P?_(?:ORDER|DMAX)|[AB]P?_\d+_\d+)$")
     for key in list(header):
         if pattern.match(key) or key in ("BSCALE", "BZERO", "BLANK", "CHECKSUM", "DATASUM"):
             del header[key]
@@ -763,14 +882,16 @@ def main():
             solver = Q.QComboBox()
             solver.addItems(["Siril solver — fresh solve per stack",
                              "Local Astrometry.net — fresh solve per stack",
-                             "Use each input's existing SIP solution"])
-            solvers = ["siril", "astrometry.net", "existing"]
+                             "Use each input's existing SIP solution",
+                             "Shared solver — independent SIP with recovery"])
+            solvers = ["siril", "astrometry.net", "existing", "astap"]
             solver.setCurrentIndex(solvers.index(self.sip_options.solver))
             form.addRow("SIP polynomial order:", order)
             form.addRow("Solutions:", solver)
             fields = []
             for title, value in (("Siril CLI executable:", self.sip_options.executable),
-                                 ("Siril 1.4 INI config:", self.sip_options.config)):
+                                 ("Siril 1.4 INI config:", self.sip_options.config),
+                                 ("ASTAP executable:", self.sip_options.astap_executable or find_astap())):
                 row = Q.QHBoxLayout()
                 field = Q.QLineEdit(value)
                 browse = Q.QPushButton("Browse…")
@@ -787,7 +908,8 @@ def main():
                             "or local Astrometry.net indices.\n"
                             "No shared distortion master and no automatic uncorrected fallback. "
                             "Existing solutions must contain nonzero SIP coefficients of the selected order. "
-                            "The reference will also be undistorted.")
+                            "The reference will also be undistorted. The shared solver must provide order-3 SIP; ASTAP needs its star database; "
+                            "recovery changes solver proxies only, never output science pixels.")
             note.setWordWrap(True)
             form.addRow(note)
             buttons = Q.QDialogButtonBox(Q.QDialogButtonBox.StandardButton.Ok |
@@ -797,7 +919,8 @@ def main():
             form.addRow(buttons)
             if dialog.exec() == Q.QDialog.DialogCode.Accepted:
                 self.sip_options = SIPOptions(fields[0].text(), fields[1].text(),
-                                              order.value(), solvers[solver.currentIndex()])
+                                              order.value(), solvers[solver.currentIndex()],
+                                              astap_executable=fields[2].text())
                 self.invalidate()
 
         def invalidate(self):

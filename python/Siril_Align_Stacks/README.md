@@ -70,6 +70,63 @@ On macOS, `sandbox-exec` protects Siril's Python environment from its automatic
 startup repair; absence of this protection stops SIP mode. Solver catalogue caches
 may still be updated by Siril.
 
+## Shared solver installation
+
+Install [astro-platesolve](../../shared/astro-platesolve/) in the Python environment
+running this script: `python -m pip install -e /path/to/siril_scripts/shared/astro-platesolve`.
+Use the same source directory in SPACER's environment for one implementation.
+The library is source-only for now, not published on PyPI. Its central configuration
+selects ASTAP or the Skyshot CLI adapter for all consumers; the ASTAP executable
+field here is a fallback when no central executable is configured. Native Siril
+and existing-SIP modes remain independent of this optional library.
+
+Skyshot schema-v1 adapter tests do not establish real solving performance or
+accuracy; its runtime/index is not installed here. Results containing `local_grid`
+are refused because exported FITS WCS cannot represent that extra mapping. The
+alignment-specific SIP coefficient, inverse and common-grid checks remain here.
+The actual solving backend is recorded in `ALNSOLVE`.
+
+## Shared solver backend (version 1.3.0)
+
+Select **SIP settings → Solutions → Shared solver — independent SIP with recovery**, normally set
+**order 3**, and check the ASTAP executable path. Install ASTAP and its local star
+database first. Siril 1.4.4 is still required to record/apply astrometric registration.
+ASTAP's documented `-sip` output is cubic; a different engine must return the selected order or the batch is rejected.
+
+This option imports the same `astro_platesolve` library as Siril Plate Solve and
+SPACER; no recovery implementation is copied into this script. ASTAP is the default: same-size mono solver proxies linearly scaled to an explicit ADU range,
+invalid-equinox correction, 500/2000-star attempts, compact-star recovery, wider
+searches and automatic field-of-view recovery. Each stack is solved independently.
+Proxy smoothing/peak isolation affects solving only; science pixels and RGB channels
+remain unchanged until the single native registration resampling. Each attempt has
+a maximum 180-second timeout; wider recovery attempts can take several minutes.
+
+Old SIP is removed from solver copies before each attempt. Stale sidecars are deleted,
+and both the exit status and newly written solution are checked. A linear-only WCS
+is rejected even if plate solving succeeded. Only new astrometry is transferred;
+reverse SIP evaluation is fitted/validated for Siril, then the usual common-grid and
+coverage checks run. Failed ASTAP solving never silently switches to another backend.
+
+ASTAP can write nonzero constant/linear A/B polynomial terms. Version 1.2.0 supports
+these in both **existing SIP** and fresh ASTAP solutions: it shifts the polynomial
+origin and absorbs the linear component into CRPIX/CD, preserving the sky mapping.
+An 11×11 field check requires equivalent coordinates within 0.0001 pixel, and inverse
+evaluation is revalidated. These terms are never simply discarded. This fixes the
+previous `Invalid SIP coefficient A_0_0` rejection for valid ASTAP-produced solutions.
+
+Tested on the supplied M39 RGB and LP stacks with installed ASTAP and Siril 1.4.4.
+Normal ASTAP proxies failed; compact-star recovery solved both independently. Both
+existing-SIP and fresh-ASTAP native registration/export completed. Fresh ASTAP/SIP
+centre/outer RMS was 0.259/0.578 pixels; existing SIP gave 0.242/0.554 pixels, while
+the similarity baseline was 0.363/0.343 pixels. Matched subsets differ, so these are
+diagnostics rather than a controlled same-star comparison. SIP was not better at the
+edges for this pair: inspect the log and compare modes rather than assuming that
+more complex registration improves every field. No PSF or photometric matching was
+applied. Sources were preserved and test results were written to temporary storage.
+
+References: [ASTAP command-line options and cubic SIP](https://www.hnsky.org/astap.htm#astap_command_line),
+[ASTAP SIP conventions](https://www.hnsky.org/sip.htm).
+
 ## Preview, diagnostics and output
 
 The grayscale preview averages RGB for display, uses shared coverage and an adaptive

@@ -100,9 +100,9 @@ class AstapTests(unittest.TestCase):
         self.app.processEvents()
         self.temp.cleanup()
 
-    def solved_result(self, *args):
-        args[1].with_suffix('.wcs').write_text(header_text(self.wcs_header))
-        return {'PLTSOLVD': 'T'}, ''
+    def solved_result(self, *args, **kwargs):
+        from astro_platesolve import SolveResult
+        return SolveResult(self.wcs_header.copy(),'astap')
 
     def fake_executable(self, code):
         script = self.root / 'fake_astap.py'
@@ -244,7 +244,7 @@ class AstapTests(unittest.TestCase):
                 original = source.read_bytes()
                 self.siril.filename = str(source)
                 self.siril.header = header_text(fits.PrimaryHDU(self.siril.pixels).header)
-                with patch.object(self.dialog, '_run_astap', side_effect=self.solved_result) as run, patch.object(QtWidgets.QMessageBox, 'information') as complete, patch.object(QtWidgets.QMessageBox, 'critical') as failed:
+                with patch.object(solver, 'solve_image', side_effect=self.solved_result) as run, patch.object(QtWidgets.QMessageBox, 'information') as complete, patch.object(QtWidgets.QMessageBox, 'critical') as failed:
                     self.dialog._solve_current_image()
                 failed.assert_not_called()
                 complete.assert_called_once()
@@ -258,7 +258,7 @@ class AstapTests(unittest.TestCase):
         source = self.jpeg()
         self.siril.filename = str(source)
         original = source.read_bytes()
-        with patch.object(self.dialog, '_run_astap', side_effect=self.solved_result) as run, patch.object(QtWidgets.QMessageBox, 'information'), patch.object(QtWidgets.QMessageBox, 'critical') as failed:
+        with patch.object(solver, 'solve_image', side_effect=self.solved_result) as run, patch.object(QtWidgets.QMessageBox, 'information'), patch.object(QtWidgets.QMessageBox, 'critical') as failed:
             self.dialog._solve_current_image()
         failed.assert_not_called()
         run.assert_called_once()
@@ -275,48 +275,8 @@ class AstapTests(unittest.TestCase):
         with self.assertRaises(solver.SolveCancelled):
             solver.prepare_compact_star_pixels(np.ones((64, 80), dtype=np.float32), cancel)
 
-    def test_normal_solve_does_not_build_compact_proxy(self):
-        mono = solver.prepare_solver_pixels(self.siril.pixels)
-        with patch.object(self.dialog, '_run_astap', side_effect=self.solved_result) as run, patch.object(solver, 'prepare_compact_star_pixels') as compact:
-            self.dialog._solve_with_strategies(Path('/fake'), self.root/'working.fit', mono, self.siril.header)
-        compact.assert_not_called()
-        self.assertEqual(run.call_count, 1)
 
-    def test_processed_recovery_precedes_wide_search_and_preserves_rgb(self):
-        source = Path(self.siril.filename)
-        source.write_bytes(b'original TIFF remains unchanged')
-        before = self.siril.pixels.copy()
-        def attempt(*args):
-            if args[2] != 'Processed-image recovery':
-                return {'PLTSOLVD': 'F', 'ERROR': 'No matching stars'}, ''
-            return self.solved_result(*args)
-        proxy = np.full((64, 80), 123., dtype=np.float32)
-        with patch.object(self.dialog, '_run_astap', side_effect=attempt) as run, patch.object(solver, 'prepare_compact_star_pixels', return_value=proxy), patch.object(QtWidgets.QMessageBox, 'information') as complete, patch.object(QtWidgets.QMessageBox, 'critical') as failed:
-            self.dialog._solve_current_image()
-        failed.assert_not_called()
-        complete.assert_called_once()
-        self.assertEqual([c.args[3] for c in run.call_args_list], [30, 30, 30])
-        output = source.with_name('original_astap_solved.fit')
-        np.testing.assert_array_equal(fits.getdata(output), before)
-        np.testing.assert_array_equal(self.siril.pixels, before)
-        np.testing.assert_array_equal(self.siril.writes[-2][1], proxy)
-        self.assertEqual(fits.getheader(output)['NAXIS3'], 3)
-        self.assertEqual(source.read_bytes(), b'original TIFF remains unchanged')
-        self.assertTrue(self.dialog.solve_button.isEnabled())
-        self.assertFalse(self.dialog.cancel_button.isEnabled())
 
-    def test_insufficient_stars_and_timeout_still_allow_recovery(self):
-        for failure in ({'PLTSOLVD': 'F', 'ERROR': 'Not enough stars detected.'}, solver.AstapTimeout('time limit')):
-            with self.subTest(failure=failure):
-                def attempt(*args):
-                    if args[2] == 'Processed-image recovery':
-                        return self.solved_result(*args)
-                    if isinstance(failure, Exception):
-                        raise failure
-                    return failure, ''
-                with patch.object(self.dialog, '_run_astap', side_effect=attempt), patch.object(solver, 'prepare_compact_star_pixels', return_value=np.ones((64,80), dtype=np.float32)):
-                    result, _ = self.dialog._solve_with_strategies(Path('/fake'), self.root/'working.fit', solver.prepare_solver_pixels(self.siril.pixels), self.siril.header)
-                self.assertEqual(result['PLTSOLVD'], 'T')
 
     def test_cancel_button_kills_process_prevents_save_and_allows_restart(self):
         pidfile = self.root/'pid'
@@ -353,7 +313,7 @@ while True: time.sleep(.05)
             os.kill(int(pidfile.read_text()), 0)
         self.assertIn('cancelled', self.dialog.log_box.toPlainText())
         self.assertTrue(self.dialog.solve_button.isEnabled())
-        with patch.object(self.dialog, '_run_astap', side_effect=self.solved_result), patch.object(QtWidgets.QMessageBox, 'information'), patch.object(QtWidgets.QMessageBox, 'critical') as failed:
+        with patch.object(solver, 'solve_image', side_effect=self.solved_result), patch.object(QtWidgets.QMessageBox, 'information'), patch.object(QtWidgets.QMessageBox, 'critical') as failed:
             self.dialog._solve_current_image()
         failed.assert_not_called()
         self.assertEqual(len(self.siril.applied_headers), 1)
@@ -366,20 +326,7 @@ while True: time.sleep(.05)
             self.assertTrue(self.dialog._busy)
             self.dialog._set_busy(False)
 
-    def test_failed_start_cleans_up_process(self):
-        with self.assertRaisesRegex(RuntimeError, 'Could not start ASTAP'):
-            self.dialog._run_astap(self.root/'missing', self.root/'working.fit', 'missing', 30, False)
-        self.assertIsNone(self.dialog._astap_process)
 
-    def test_stale_sidecars_removed_before_failed_attempt(self):
-        path = self.root/'working.fit'
-        path.with_suffix('.wcs').write_text('old solution')
-        path.with_suffix('.ini').write_text('PLTSOLVD=T')
-        executable = self.fake_executable('raise SystemExit(1)\n')
-        with self.assertRaisesRegex(RuntimeError, 'did not produce an .ini'):
-            self.dialog._run_astap(executable, path, 'failure', 30, False)
-        self.assertFalse(path.with_suffix('.wcs').exists())
-        self.assertIsNone(self.dialog._astap_process)
 
 
 if __name__ == '__main__':

@@ -268,6 +268,15 @@ def solve(pixels, header, options, progress, cancel):
                 progress(Diagnostic('Too few detected stars; trying processed-image recovery before wider searches.'))
             if solved is not None:solved=clean_solution_header(solved)
             attempts.append(dict(strategy=strategy,stars=stars,fov=search.fov,radius=search.radius,solved=solved is not None,error=error))
+            if solved is not None and options.require_sip:
+                try:
+                    validate_solution(solved, pixels.shape, require_sip=True)
+                except ValueError as exc:
+                    error = 'Candidate rejected for required SIP: '+str(exc)
+                    progress(Diagnostic(error+' Trying the next star sample/recovery strategy.'))
+                    attempts[-1]['accepted'] = False
+                    attempts[-1]['error'] = error
+                    solved = None
             if solved is not None and options.confirm_original:
                 # Every first match is a seed. Confirm the measured scale and
                 # refine with more real photographed stars before committing WCS.
@@ -303,6 +312,9 @@ def solve(pixels, header, options, progress, cancel):
                             candidate=clean_solution_header(candidate)
                             accepted,comparison=refinement_consistent(seed,candidate,pixels.shape[-1],pixels.shape[-2])
                             if 'inexact scale' in str(candidate.get('WARNING','')).lower(): accepted=False
+                            if accepted and options.require_sip:
+                                try: validate_solution(candidate,pixels.shape,require_sip=True)
+                                except ValueError: accepted=False
                             progress(Diagnostic(('Refinement accepted: ' if accepted else 'Refinement rejected: ')+comparison))
                             if not accepted: error='Refined WCS failed consistency/scale checks.'
                         attempts.append(dict(strategy='original-refinement',stars=refinement_stars,fov=guided.fov,radius=guided.radius,solved=candidate is not None,accepted=accepted,error=error))

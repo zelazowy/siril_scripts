@@ -143,9 +143,16 @@ class SIPTests(unittest.TestCase):
             self.assertLess(stats['outer']['rms'], .1)
             self.assertAlmostEqual(float(np.median(images[1][0][mask])), -300., delta=1.)
             crop = largest_rectangle(mask)
-            outputs = save_outputs(paths, images, crop, '_aligned_sip')
+            outputs = save_outputs(paths, images, crop, '_aligned_sip', output_format='fits')
             headers = [fits.getheader(p) for p in outputs]
             same_output_grid(headers, (crop[3], crop[2]))
+            original_outputs = save_outputs(paths, images, crop, '_original')
+            from Siril_Align_Stacks import read_stack
+            restored = [read_stack(p) for p in original_outputs]
+            self.assertEqual(original_outputs[1].suffix, '.tif')
+            x,y,width,height = crop
+            np.testing.assert_array_equal(restored[1][0], images[1][0][y:y+height,x:x+width])
+            same_output_grid([header for _,header in restored], (height,width))
             for i, path in enumerate(paths):
                 from Siril_Align_Stacks import read_stack
                 np.testing.assert_array_equal(read_stack(path)[0], originals[i])

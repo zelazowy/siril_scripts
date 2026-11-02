@@ -1,4 +1,4 @@
-"""Align a few mono/RGB FITS stacks; run from Siril's Python menu.
+"""Align mono/RGB FITS, TIFF and JPEG images; run from Siril's Python menu.
 
 Also runs standalone when dependencies are installed. Similarity matching or
 Siril 1.4.4 sequence SIP astrometry; one linear resampling of science pixels.
@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 
 @dataclass
@@ -23,7 +23,7 @@ class SIPOptions:
     executable: str = ""
     config: str = ""
     order: int = 3
-    solver: str = "siril"  # siril, astrometry.net, existing, astap
+    solver: str = "astap"  # Shared backend by default; siril, astrometry.net, existing also available
     timeout: int = 900
     astap_executable: str = ""
 
@@ -480,7 +480,7 @@ def align_sip(paths, options, report=lambda message: None):
             staged = data if data.ndim == 3 and data.shape[0] == 3 else \
                 np.repeat(mono(data)[None], 3, axis=0)
             if options.solver == "astap":
-                report(f"Solving independently with ASTAP: {Path(paths[i]).name}")
+                report(f"Solving independently with shared solver: {Path(paths[i]).name}")
                 header = solve_astap_stack(data, header, options, root/f"solver_{i:05d}.fit", report)
             shared_backends.append(header.get('ALNBACK', options.solver))
             # Siril auto-divides float FITS >1 by 65535. Encode private copies
@@ -494,6 +494,12 @@ def align_sip(paths, options, report=lambda message: None):
                 report(f"{Path(paths[i]).name}: encoding temporary Siril copy into [0,1]; "
                        "original numerical units will be restored after registration.")
             staged_header = header.copy()
+            if 'EQUINOX' in staged_header:
+                try: equinox = float(staged_header['EQUINOX'])
+                except (TypeError, ValueError): equinox = float('nan')
+                if not np.isfinite(equinox) or not 1000 <= equinox <= 3000:
+                    staged_header['EQUINOX'] = 2000.
+                    report(f"{Path(paths[i]).name}: undefined EQUINOX replaced with J2000 in the private Siril copy.")
             for key in ('BSCALE', 'BZERO', 'DATAMIN', 'DATAMAX'):
                 staged_header.remove(key, ignore_missing=True)
             fits.PrimaryHDU(staged, staged_header).writeto(source/f"input_{i:05d}.fit")
@@ -799,11 +805,70 @@ def output_header(original, reference, crop):
     return header
 
 
-def save_outputs(paths, images, crop, suffix):
+def compact_raster_header(header):
+    """Small FITS description: current pixel grid, not stale camera EXIF geometry."""
+    from astropy.io import fits
+    from astropy.wcs import WCS
+    result = fits.Header()
+    for key in ('SIMPLE', 'BITPIX', 'NAXIS', 'NAXIS1', 'NAXIS2', 'NAXIS3'):
+        if key in header: result[key] = header[key]
+    wcs = WCS(header, naxis=2)
+    if wcs.has_celestial:
+        result.update(wcs.to_header(relax=True))
+    for key in ('OBJECT', 'FILTER', 'EXPTIME', 'DATE-OBS', 'FOCALLEN', 'XPIXSZ', 'YPIXSZ',
+                'ALNMODE', 'ALNORDER', 'ALNSOLVE', 'ALNSIRIL', 'ALNINPUT'):
+        if key in header: result[key] = header[key]
+    result['ROWORDER'] = 'BOTTOM-UP'
+    return result.tostring(sep='\n', endcard=True, padding=False)
+
+
+def write_raster_output(path, original_path, pixels, header):
+    """Restore top-left storage, original TIFF sample type or high-quality JPEG."""
+    from PIL import Image
+    raster = pixels[..., ::-1, :]
+    if raster.ndim == 3:
+        raster = raster[0] if raster.shape[0] == 1 else np.moveaxis(raster, 0, -1)
+    description = compact_raster_header(header)
+    if path.suffix.lower() in ('.tif', '.tiff'):
+        import tifffile
+        with tifffile.TiffFile(original_path) as original:
+            page = original.pages[0]
+            dtype = page.dtype
+            profile = page.tags.get(34675)
+            profile = profile.value if profile is not None else None
+        if dtype.kind in 'ui':
+            limits = np.iinfo(dtype)
+            raster = np.clip(np.rint(raster), limits.min, limits.max).astype(dtype)
+        elif dtype.kind == 'b':
+            raster = raster >= .5
+        else:
+            raster = raster.astype(dtype)
+        options = {'iccprofile': profile} if profile else {}
+        # Exclusive creation prevents a file appearing during export being overwritten.
+        with path.open('xb') as stream:
+            tifffile.imwrite(stream, np.ascontiguousarray(raster),
+                             photometric='rgb' if raster.ndim == 3 else 'minisblack',
+                             description=description, metadata=None, **options)
+    else:
+        with Image.open(original_path) as original:
+            profile = original.info.get('icc_profile')
+        raster = np.clip(np.rint(raster), 0, 255).astype(np.uint8)
+        exif = Image.Exif()
+        exif[274], exif[270] = 1, description
+        options = {'icc_profile': profile} if profile else {}
+        with path.open('xb') as stream:
+            Image.fromarray(raster).save(stream, format='JPEG', quality=95, subsampling=0,
+                                         exif=exif, **options)
+
+
+def save_outputs(paths, images, crop, suffix, output_format="original"):
     from astropy.io import fits
     if not suffix or any(c in suffix for c in '/\\'):
         raise ValueError("Enter a non-empty suffix without path separators.")
-    outputs = [Path(p).with_name(Path(p).stem + suffix + ".fit") for p in paths]
+    if output_format not in ('original', 'fits'):
+        raise ValueError('Choose original format or FITS output.')
+    outputs = [Path(p).with_name(Path(p).stem + suffix +
+               (Path(p).suffix if output_format == 'original' else '.fit')) for p in paths]
     # JPEG/TIFF versions often share a basename in the same folder.
     from collections import Counter
     counts = Counter(outputs)
@@ -817,9 +882,13 @@ def save_outputs(paths, images, crop, suffix):
     for data, _ in images:
         if x + w > data.shape[-1] or y + h > data.shape[-2]:
             raise ValueError("Crop exceeds image dimensions.")
-    for path, (data, header) in zip(outputs, images):
-        fits.PrimaryHDU(data=data[..., y:y+h, x:x+w],
-                        header=output_header(header, images[0][1], crop)).writeto(path)
+    for path, source, (data, header) in zip(outputs, paths, images):
+        pixels = data[..., y:y+h, x:x+w]
+        hdu = fits.PrimaryHDU(data=pixels, header=output_header(header, images[0][1], crop))
+        if path.suffix.lower() in ('.tif', '.tiff', '.jpg', '.jpeg'):
+            write_raster_output(path, source, pixels, hdu.header)
+        else:
+            hdu.writeto(path)
     return outputs
 
 
@@ -954,8 +1023,10 @@ def main():
             self.choice.currentIndexChanged.connect(self.display)
             self.suffix = Q.QLineEdit("_aligned")
             self.suffix.setMaximumWidth(140)
-            self.save = Q.QPushButton("Save aligned FITS")
-            for widget in (self.auto, self.choice, Q.QLabel("Suffix:"), self.suffix, self.save):
+            self.output_format = Q.QComboBox()
+            self.output_format.addItems(['Original format', 'FITS (float32)'])
+            self.save = Q.QPushButton("Save aligned images")
+            for widget in (self.auto, self.choice, Q.QLabel("Suffix:"), self.suffix, self.output_format, self.save):
                 row.addWidget(widget)
             layout.addLayout(row)
             self.log = Q.QPlainTextEdit()
@@ -1102,7 +1173,8 @@ def main():
                 x, y, w, h = self.preview.crop
                 if w <= 0 or h <= 0 or not self.common[y:y+h, x:x+w].all():
                     raise ValueError("Crop includes uncovered edges. Use Automatic common crop or draw a smaller rectangle.")
-                paths = save_outputs(self.paths, self.images, self.preview.crop, self.suffix.text())
+                paths = save_outputs(self.paths, self.images, self.preview.crop, self.suffix.text(),
+                                     'original' if self.output_format.currentIndex() == 0 else 'fits')
                 self.log.appendPlainText("Saved:\n" + "\n".join(map(str, paths)))
                 Q.QMessageBox.information(self, "Saved", "\n".join(map(str, paths)))
             except Exception as exc:

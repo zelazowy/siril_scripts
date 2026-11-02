@@ -61,6 +61,31 @@ class RasterTests(unittest.TestCase):
                 image.write(data);image.write(data)
             with self.assertRaisesRegex(ValueError,'multipage'):read_stack(root/'pages.tif')
 
+    def test_original_format_export_preserves_tiff_type_and_jpeg_orientation(self):
+        rng=np.random.default_rng(8)
+        raster=rng.integers(0,65535,(30,40,3),dtype=np.uint16)
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);paths=[root/'image.tif',root/'image.jpg',root/'float.tiff']
+            tifffile.imwrite(paths[0],raster,photometric='rgb')
+            exif=Image.Exif();exif[274]=6
+            Image.fromarray((raster/257).astype(np.uint8)).save(paths[1],quality=95,exif=exif)
+            tifffile.imwrite(paths[2],raster.astype(np.float32)/65535,photometric='rgb')
+            originals=[p.read_bytes() for p in paths]
+            images=[read_stack(p) for p in paths]
+            crop=(2,3,20,18);x,y,w,h=crop
+            outputs=save_outputs(paths,images,crop,'_aligned')
+            self.assertEqual([p.suffix for p in outputs],['.tif','.jpg','.tiff'])
+            for index in (0,2):
+                exported=tifffile.imread(outputs[index])
+                self.assertEqual(exported.dtype,np.uint16 if index==0 else np.float32)
+                expected=np.moveaxis(images[index][0][...,y:y+h,x:x+w][:,::-1,:],0,-1)
+                np.testing.assert_array_equal(exported,expected.astype(exported.dtype))
+                np.testing.assert_array_equal(read_stack(outputs[index])[0],images[index][0][...,y:y+h,x:x+w])
+            with Image.open(outputs[1]) as image:
+                self.assertEqual(image.size,(w,h));self.assertEqual(image.getexif().get(274),1)
+            self.assertEqual([p.read_bytes() for p in paths],originals)
+            with self.assertRaises(ValueError):save_outputs(paths,images,crop,'_aligned')
+
     def test_stretched_mixed_inputs_register_crop_and_export_losslessly(self):
         rng=np.random.default_rng(42)
         stars=np.zeros((256,280),np.float32)
@@ -80,7 +105,7 @@ class RasterTests(unittest.TestCase):
             originals=[p.read_bytes() for p in paths]
             images,common=align(paths)
             crop=largest_rectangle(common);x,y,w,h=crop
-            outputs=save_outputs(paths,images,crop,'_aligned')
+            outputs=save_outputs(paths,images,crop,'_aligned',output_format='fits')
             # Distinct source formats sharing a stem must not overwrite each other.
             for output,(aligned,_) in zip(outputs,images):
                 np.testing.assert_array_equal(fits.getdata(output),aligned[...,y:y+h,x:x+w])

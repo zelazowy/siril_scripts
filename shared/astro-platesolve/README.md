@@ -69,6 +69,12 @@ lifecycle here. SPACER sets `confirm_original=True`: seeds must pass its existin
 original-pixel confirmation, parity/scale/corner and inexact-scale screens before a
 project can be committed. Other adapters retain their prior no-confirmation policy.
 A compact proxy is never substituted for source science pixels.
+When `require_sip=True`, linear-only candidates are rejected within ASTAP's retry
+loop so a larger star sample can produce SIP instead of terminating early at generic
+validation. Original-pixel refinements must also retain SIP. Real M31 validation
+confirmed the first 500-star candidate lacked enough quads for SIP and the 2000-star
+retry succeeded; independent cubic solutions then completed native registration.
+
 
 Siril retains image locking/undo, JPEG hint handling, optional mirror correction
 and its existing save policy. Align Stacks retains independent SIP validation,

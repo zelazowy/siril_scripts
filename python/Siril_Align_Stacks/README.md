@@ -9,12 +9,14 @@ Astropy, SciPy, Astroalign, SEP, Pillow and tifffile when needed.
    if needed. Remove a selected row with **Backspace** or **Delete**; its file stays intact.
 3. Choose **Similarity star matching** (the previous method), or **Independent SIP astrometry**.
    For the latter, open **SIP settings**, check the executable/configuration paths,
-   and normally leave the polynomial order at **3** and solver at **Siril — fresh solve per stack**.
+   and normally leave the polynomial order at **3** and solver at **Shared solver** (the new default).
 4. Click **Align / preview**. The log reports solving, validation and stellar residuals.
 5. The green rectangle starts at the largest rectangle within shared valid coverage.
    Drag a smaller crop or use **Automatic common crop** to reset. Switch previews to inspect.
-6. **Save aligned FITS** writes `original_name_aligned.fit` for similarity, or
-   `original_name_aligned_sip.fit` for SIP. Existing files aren't overwritten.
+6. **Save aligned images** defaults to **Original format**: FITS stays FITS, TIFF
+   stays TIFF and JPEG stays JPEG. The suffix is `_aligned` for similarity or
+   `_aligned_sip` for SIP. Choose **FITS (float32)** to retain fractional resampling
+   values in a common format. Existing files aren't overwritten.
 
 ## TIFF and JPEG inputs (version 1.4.0)
 
@@ -44,12 +46,17 @@ This is not a photometric calibration or a permanent intensity normalization.
 FITS and raster rows use the same internal coordinate convention; previews retain
 the existing array-row-zero-at-top convention.
 
-Output is still **float32 FITS** with the shared crop and selected suffix, avoiding
-another JPEG compression/quantization step. A TIFF/JPEG pair sharing the same basename
-gets format-qualified output names (for example `image_tif_aligned.fit` and
-`image_jpg_aligned.fit`). Existing files are never overwritten. JPEG EXIF/ICC and TIFF
-container metadata aren't copied wholesale; compatible embedded FITS observational
-metadata is retained. The decoded RGB channel values receive the same mapping.
+Output defaults to the **original format** (version 1.5.0). TIFF retains its source
+sample type (for example uint16 or float32), with lossless uncompressed storage;
+integer samples round to the original representable range after interpolation.
+JPEG uses quality 95 without chroma subsampling and is necessarily recompressed.
+Choose **FITS (float32)** to avoid JPEG loss or integer quantization. Original ICC
+profiles are retained for TIFF/JPEG. Container metadata isn't copied wholesale;
+outputs embed a compact, updated FITS/WCS description and normal storage orientation.
+
+When forcing FITS output, a TIFF/JPEG pair sharing a basename gets format-qualified
+names (`image_tif_aligned.fit`, `image_jpg_aligned.fit`). Original-format exports
+keep their original extension. Existing files are never overwritten.
 
 Siril-style FITS cards in TIFF ImageDescription/JPEG EXIF are reused only when their
 embedded dimensions match and storage orientation is normal. Metadata is discarded
@@ -106,7 +113,7 @@ Mono inputs are replicated exactly into three planes in the private sequence and
 returned to mono afterward. RGB science pixels receive one identical mapping across
 all channels. There is **one linear resampling per science stack**, composing
 undistortion and projection. Coverage masks use the same native transformations
-separately; cropping is array slicing. Outputs preserve numerical units as float32:
+separately; cropping is array slicing. Internal images and FITS exports preserve numerical units as float32 (original-format raster exports use the sample type described above):
 no stretch, colour calibration, intensity normalization, background correction,
 star removal or continuum subtraction is applied. Resampling redistributes pixel
 values and can change sampled star peaks/aperture flux; it does not replace the
@@ -176,6 +183,24 @@ applied. Sources were preserved and test results were written to temporary stora
 
 References: [ASTAP command-line options and cubic SIP](https://www.hnsky.org/astap.htm#astap_command_line),
 [ASTAP SIP conventions](https://www.hnsky.org/sip.htm).
+
+## M31 SIP recovery fix (version 1.5.0)
+
+A successful sky position with linear WCS is not enough for SIP alignment. The shared
+ASTAP backend now keeps trying larger star samples/recovery strategies when SIP is
+required and the first candidate has no distortion coefficients. A run that never
+produces valid nonzero SIP still fails explicitly; it never relabels a linear result.
+An undefined EQUINOX is repaired in private Siril staging headers as well as in the
+shared solver. Original files remain unchanged.
+
+On the supplied M31 pair, ASTAP's initial 500-star candidate reported insufficient
+quads for SIP; the 2000-star retry produced cubic SIP. Both images solved independently
+and completed native Siril 1.4.5 registration, with a shared 5291×3512 crop. Measured
+centre/outer RMS changed from 0.751/2.464 pixels (similarity) to 0.309/0.709 pixels
+(shared ASTAP/SIP). Matched subsets differ; these are diagnostics, not a same-star
+accuracy guarantee. The native Siril fresh solver still failed to solve this pair.
+Use the default **Shared solver**, order **3**, for this tested route. Existing
+order-2 models may be selected explicitly with **Existing SIP**, order **2**.
 
 ## Preview, diagnostics and output
 

@@ -47,6 +47,25 @@ class SharedTests(unittest.TestCase):
             solve_image(np.ones((12,16)),header(),SolveOptions(backend='never'),cancel=cancel)
         self.assertEqual(called,[])
 
+    def test_astap_sip_request_continues_after_linear_candidate(self):
+        from astro_platesolve import astap
+        from astropy.wcs import Sip
+        w=WCS(header());a=np.zeros((4,4));b=a.copy();a[3,0]=1e-8;b[0,3]=-1e-8
+        w.wcs.ctype=['RA---TAN-SIP','DEC--TAN-SIP']
+        w.sip=Sip(a,b,None,None,w.wcs.crpix)
+        with patch('astro_platesolve.astap.run_attempt',side_effect=[(header(),''),(w.to_header(relax=True),'')]) as run:
+            result=solve_image(np.arange(192,dtype=np.float32).reshape(12,16),header(),
+                SolveOptions(backend='astap',executable='/bin/sh',require_sip=True))
+        self.assertEqual([call.args[5] for call in run.call_args_list],[500,2000])
+        self.assertFalse(result.attempts[0]['accepted'])
+        self.assertIsNotNone(WCS(result.header).sip)
+
+    def test_astap_never_accepts_linear_only_recovery_when_sip_required(self):
+        with patch('astro_platesolve.astap.run_attempt',return_value=(header(),'')):
+            with self.assertRaisesRegex(RuntimeError,'required SIP'):
+                solve_image(np.arange(192,dtype=np.float32).reshape(12,16),header(),
+                    SolveOptions(backend='astap',executable='/bin/sh',require_sip=True))
+
     def skyshot_case(self,grid=None,status='solved',schema=1,require_sip=False,returncode=0):
         with tempfile.TemporaryDirectory() as folder:
             options=SolveOptions(backend='skyshot',executable=__file__,database=folder,require_sip=require_sip)

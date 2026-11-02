@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 
 @dataclass
@@ -473,6 +473,7 @@ def align_sip(paths, options, report=lambda message: None):
                            options.solver, options.timeout)
         version = check_siril(local, work, report)
         shared_backends = []
+        science_scaling = []
         for i, (data, header) in enumerate(originals):
             # Native sequences require a common channel count. Replicating mono
             # into RGB is exact; it neither interpolates nor changes its values.
@@ -482,7 +483,20 @@ def align_sip(paths, options, report=lambda message: None):
                 report(f"Solving independently with ASTAP: {Path(paths[i]).name}")
                 header = solve_astap_stack(data, header, options, root/f"solver_{i:05d}.fit", report)
             shared_backends.append(header.get('ALNBACK', options.solver))
-            fits.PrimaryHDU(staged, header).writeto(source/f"input_{i:05d}.fit")
+            # Siril auto-divides float FITS >1 by 65535. Encode private copies
+            # into [0,1] ourselves, then reverse this exact affine encoding on
+            # the registered science image. One mapping for every RGB channel.
+            offset = min(0., float(np.min(staged)))
+            divisor = max(1., float(np.max(staged))-offset)
+            science_scaling.append((divisor, offset))
+            if divisor != 1 or offset != 0:
+                staged = (staged-offset)/divisor
+                report(f"{Path(paths[i]).name}: encoding temporary Siril copy into [0,1]; "
+                       "original numerical units will be restored after registration.")
+            staged_header = header.copy()
+            for key in ('BSCALE', 'BZERO', 'DATAMIN', 'DATAMAX'):
+                staged_header.remove(key, ignore_missing=True)
+            fits.PrimaryHDU(staged, staged_header).writeto(source/f"input_{i:05d}.fit")
         report("Creating private sequence copies; originals stay untouched.")
         run_siril(local, source, ["convert stack -out=../work"], report)
         solve = f"seqplatesolve stack -order={options.order} -nocache -nocrop"
@@ -524,6 +538,8 @@ def align_sip(paths, options, report=lambda message: None):
         if "undistortion will be applied" not in applied_log:
             raise ValueError("Siril did not confirm applying distortion correction; batch rejected.")
         outputs = [read_stack(work/f"aligned_stack_{i+1:05d}.fit") for i in range(len(paths))]
+        outputs = [(data*divisor+offset, header) if divisor != 1 or offset != 0 else (data, header)
+                   for (data, header), (divisor, offset) in zip(outputs, science_scaling)]
         shape = outputs[0][0].shape[-2:]
         if any(data.shape != (3, *shape) for data, _ in outputs):
             raise ValueError("Native output dimensions or RGB channel counts differ.")
@@ -563,7 +579,88 @@ def align_sip(paths, options, report=lambda message: None):
         return images, common
 
 
+def raster_stack(path):
+    """Decode a single raster onto the FITS bottom-up grid without stretching."""
+    from astropy.io import fits
+    from PIL import Image, ImageOps
+    suffix = Path(path).suffix.lower()
+    description = None
+    if suffix in ('.tif', '.tiff'):
+        import tifffile
+        with tifffile.TiffFile(path) as image:
+            if len(image.pages) != 1:
+                raise ValueError('Choose a single-image TIFF, not a multipage stack.')
+            page = image.pages[0]
+            if page.photometric.name not in ('RGB', 'MINISBLACK'):
+                raise ValueError('TIFF must be grayscale or RGB, without palette/CMYK encoding.')
+            orientation = int(page.tags['Orientation'].value) if 'Orientation' in page.tags else 1
+            description = page.description
+            try:
+                raster = page.asarray()
+            except (ValueError, KeyError) as exc:
+                raise ValueError('Cannot decode TIFF; export uncompressed TIFF or install its imagecodecs dependency.') from exc
+            axes = page.axes
+        if axes == 'SYX':
+            raster = np.moveaxis(raster, 0, -1)
+        elif axes not in ('YX', 'YXS'):
+            raise ValueError(f'Unsupported TIFF axes {axes}; choose one mono or RGB image.')
+        # Normalize TIFF storage orientation in integer/float array space: no interpolation.
+        if orientation == 2: raster = np.fliplr(raster)
+        elif orientation == 3: raster = np.flip(raster, axis=(0, 1))
+        elif orientation == 4: raster = np.flipud(raster)
+        elif orientation == 5: raster = np.swapaxes(raster, 0, 1)
+        elif orientation == 6: raster = np.rot90(raster, -1, axes=(0, 1))
+        elif orientation == 7: raster = np.flip(np.swapaxes(raster, 0, 1), axis=(0, 1))
+        elif orientation == 8: raster = np.rot90(raster, 1, axes=(0, 1))
+        elif orientation != 1: raise ValueError('Invalid TIFF Orientation tag.')
+    else:
+        with Image.open(path) as image:
+            if image.mode not in ('L', 'RGB'):
+                raise ValueError('JPEG must be grayscale or RGB; convert CMYK images first.')
+            orientation = int(image.getexif().get(274, 1))
+            description = image.getexif().get(270)
+            raster = np.array(ImageOps.exif_transpose(image), copy=True)
+    if raster.ndim == 2:
+        data = raster[None]
+    elif raster.ndim == 3 and raster.shape[-1] in (1, 3):
+        data = np.moveaxis(raster, -1, 0)
+    else:
+        raise ValueError('Choose mono or RGB rasters without alpha channels.')
+    height, width = data.shape[-2:]
+    # Only trust an embedded FITS frame when dimensions and orientation still match.
+    header = fits.Header()
+    if isinstance(description, bytes):
+        description = description.decode('ascii', errors='replace')
+    if isinstance(description, str) and orientation == 1:
+        text = description.rstrip('\x00').strip()
+        if text.startswith('SIMPLE') and text.splitlines()[-1].strip() == 'END':
+            try:
+                embedded = fits.Header.fromstring('\n'.join(text.splitlines()), sep='\n')
+                if (embedded.get('NAXIS1'), embedded.get('NAXIS2')) == (width, height):
+                    # Structural/scaling cards describe the old file, not these samples.
+                    for card in embedded.cards:
+                        if card.keyword not in ('SIMPLE', 'BITPIX', 'EXTEND', 'BSCALE', 'BZERO',
+                                                'BLANK', 'CHECKSUM', 'DATASUM') and not card.keyword.startswith('NAXIS'):
+                            header.append(card)
+            except (ValueError, TypeError):
+                pass
+    data = np.ascontiguousarray(data[:, ::-1, :], dtype=np.float32)
+    if not np.isfinite(data).all():
+        raise ValueError(f'Non-finite pixels in {path}; repair them first.')
+    if data.shape[0] == 1:
+        data = data[0]
+    header['ROWORDER'] = 'BOTTOM-UP'
+    header['ALNINPUT'] = (suffix[1:].upper(), 'Decoded raster; existing stretch retained')
+    header.add_history('Raster decoded without stretching or intensity normalization; bottom-up FITS grid.')
+    # Generate structural FITS cards in their mandated order for native Siril staging.
+    return data, fits.PrimaryHDU(data, header).header.copy()
+
+
 def read_stack(path):
+    if Path(path).suffix.lower() in ('.tif', '.tiff', '.jpg', '.jpeg'):
+        return raster_stack(path)
+    if Path(path).suffix.lower() not in ('.fit', '.fits', '.fts'):
+        raise ValueError('Choose FITS, TIFF or JPEG images.')
     from astropy.io import fits
     with fits.open(path, memmap=False) as hdus:
         hdu = next((h for h in hdus if h.data is not None
@@ -707,6 +804,11 @@ def save_outputs(paths, images, crop, suffix):
     if not suffix or any(c in suffix for c in '/\\'):
         raise ValueError("Enter a non-empty suffix without path separators.")
     outputs = [Path(p).with_name(Path(p).stem + suffix + ".fit") for p in paths]
+    # JPEG/TIFF versions often share a basename in the same folder.
+    from collections import Counter
+    counts = Counter(outputs)
+    outputs = [Path(p).with_name(Path(p).stem + "_" + Path(p).suffix[1:].lower() + suffix + ".fit")
+               if counts[output] > 1 else output for p, output in zip(paths, outputs)]
     if len(set(outputs)) != len(outputs) or any(p.exists() for p in outputs):
         raise ValueError("An output already exists or output names collide. Change the suffix.")
     x, y, w, h = crop
@@ -727,7 +829,7 @@ def main():
     except ImportError:
         s = None
     if s is not None:
-        for package in ("PyQt6", "astropy", "scipy", "astroalign", "sep"):
+        for package in ("PyQt6", "astropy", "scipy", "astroalign", "sep", "Pillow", "tifffile"):
             s.ensure_installed(package)
     from PyQt6 import QtCore, QtGui, QtWidgets as Q
     app = Q.QApplication.instance() or Q.QApplication(sys.argv)
@@ -813,7 +915,7 @@ def main():
             self.images = None
             self.worker = None
             layout = Q.QVBoxLayout(self)
-            layout.addWidget(Q.QLabel("Add FITS stacks. The first image is the reference.\n"
+            layout.addWidget(Q.QLabel("Add FITS, TIFF or JPEG images. The first image is the reference.\n"
                                      "Optionally use Make reference to change it. Delete/Backspace removes a selected stack."))
             self.files = Q.QListWidget()
             self.files.setMaximumHeight(110)
@@ -903,12 +1005,12 @@ def main():
                 row.addWidget(field); row.addWidget(browse)
                 form.addRow(title, row)
                 fields.append(field)
-            note = Q.QLabel("Each input needs its own accurate coordinates and effective pixel scale "
+            note = Q.QLabel("Native Siril solving needs accurate coordinates and effective pixel scale "
                             "in its FITS header. Fresh solves use Siril's configured catalogues "
                             "or local Astrometry.net indices.\n"
                             "No shared distortion master and no automatic uncorrected fallback. "
                             "Existing solutions must contain nonzero SIP coefficients of the selected order. "
-                            "The reference will also be undistorted. The shared solver must provide order-3 SIP; ASTAP needs its star database; "
+                            "The reference will also be undistorted. TIFF/JPEG without astrometry: use Shared solver or similarity matching. ASTAP needs its star database; "
                             "recovery changes solver proxies only, never output science pixels.")
             note.setWordWrap(True)
             form.addRow(note)
@@ -932,7 +1034,7 @@ def main():
             self.preview.box = None
 
         def add_files(self):
-            paths, _ = Q.QFileDialog.getOpenFileNames(self, "Choose stacks", "", "FITS (*.fit *.fits *.fts)")
+            paths, _ = Q.QFileDialog.getOpenFileNames(self, "Choose stacks", "", "Images (*.fit *.fits *.fts *.tif *.tiff *.jpg *.jpeg *.FIT *.FITS *.TIF *.TIFF *.JPG *.JPEG)")
             existing = {self.files.item(i).text() for i in range(self.files.count())}
             for path in paths:
                 if path not in existing:

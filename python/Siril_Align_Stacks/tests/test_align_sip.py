@@ -106,7 +106,7 @@ class SIPTests(unittest.TestCase):
         sky = solution().wcs_pix2world(rng.uniform(25, 230, (100, 2)), 0)
         yy, xx = np.mgrid[:256, :256]
         with tempfile.TemporaryDirectory() as folder:
-            paths = [Path(folder)/'rgb.fit', Path(folder)/'mono.fit']
+            paths = [Path(folder)/'rgb.fit', Path(folder)/'mono.tif']
             originals = []
             for i, coeff in enumerate((3e-6, -1e-6)):
                 w = solution(coeff)
@@ -120,8 +120,14 @@ class SIPTests(unittest.TestCase):
                     data += (.1+.01*(j % 10))*np.exp(-((xx-x)**2+(yy-y)**2)/4)
                 data += rng.normal(0, .00002, data.shape).astype(np.float32)
                 if i == 0: data = np.stack([data, data*1.2, data*.8])
+                else: data = data*10000-500  # Preserve >1 values and negative floating-point samples.
                 header = w.to_header(relax=True)
-                fits.writeto(paths[i], data, header)
+                if i == 0:
+                    fits.writeto(paths[i], data, header)
+                else:
+                    import tifffile
+                    description = fits.PrimaryHDU(data, header).header.tostring(sep='\n', padding=False)
+                    tifffile.imwrite(paths[i], data[::-1], description=description, metadata=None)
                 originals.append(data.copy())
             options = SIPOptions(os.environ['SIRIL_TEST_CLI'],
                                  os.environ['SIRIL_TEST_CONFIG'], solver='existing')
@@ -135,13 +141,14 @@ class SIPTests(unittest.TestCase):
                                       stellar_centroids(images[1][0]), mask.shape, mask)
             self.assertGreater(stats['outer']['count'], 10)
             self.assertLess(stats['outer']['rms'], .1)
-            self.assertAlmostEqual(float(np.median(images[1][0][mask])), .02, delta=.0001)
+            self.assertAlmostEqual(float(np.median(images[1][0][mask])), -300., delta=1.)
             crop = largest_rectangle(mask)
             outputs = save_outputs(paths, images, crop, '_aligned_sip')
             headers = [fits.getheader(p) for p in outputs]
             same_output_grid(headers, (crop[3], crop[2]))
             for i, path in enumerate(paths):
-                np.testing.assert_array_equal(fits.getdata(path), originals[i])
+                from Siril_Align_Stacks import read_stack
+                np.testing.assert_array_equal(read_stack(path)[0], originals[i])
                 self.assertEqual(headers[i]['ALNMODE'], 'SIP')
 
 

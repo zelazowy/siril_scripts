@@ -2,9 +2,9 @@
 
 Run `Siril_Align_Stacks.py` from Siril's Python scripts menu. Place it in your
 configured Python scripts directory. The dependency helper installs PyQt6,
-Astropy, SciPy, Astroalign and SEP when needed.
+Astropy, SciPy, Astroalign, SEP, Pillow and tifffile when needed.
 
-1. **Add images**: choose two or more mono or RGB FITS stacks from any folders.
+1. **Add images**: choose two or more mono or RGB FITS, TIFF or JPEG images from any folders.
 2. The first row sets the output grid. Select another row and click **Make reference**
    if needed. Remove a selected row with **Backspace** or **Delete**; its file stays intact.
 3. Choose **Similarity star matching** (the previous method), or **Independent SIP astrometry**.
@@ -15,6 +15,56 @@ Astropy, SciPy, Astroalign and SEP when needed.
    Drag a smaller crop or use **Automatic common crop** to reset. Switch previews to inspect.
 6. **Save aligned FITS** writes `original_name_aligned.fit` for similarity, or
    `original_name_aligned_sip.fit` for SIP. Existing files aren't overwritten.
+
+## TIFF and JPEG inputs (version 1.4.0)
+
+Finished/stretched `.tif`, `.tiff`, `.jpg` and `.jpeg` images are accepted alongside
+FITS, including mixed input formats. **Star matching (similarity)** needs no plate
+solution and is the easiest starting point. Stretched images with very saturated,
+removed or distorted stars may still fail matching.
+
+TIFF supports single-image grayscale/RGB data, including 16-bit and float samples
+and planar RGB. JPEG supports grayscale/RGB. EXIF/TIFF orientation is applied once,
+then raster rows are placed on the bottom-up FITS grid without interpolation.
+Alpha, CMYK/palette TIFF, and multipage TIFF are rejected rather than silently
+converted or flattened. TIFF compression requiring an external codec needs
+`imagecodecs`; alternatively export an uncompressed TIFF. JPEG's existing compression
+artifacts remain part of its decoded image.
+
+The original sample values are converted to float32; there is no automatic stretch,
+unstretch, color conversion, clipping or intensity normalization. Existing display
+stretching affects previews only. The result remains nonlinear if the input was
+stretched: use original linear stacks when linear continuum subtraction is needed.
+For native SIP registration, private science copies outside [0,1] use a reversible
+affine range encoding to prevent Siril's automatic float-FITS unit conversion.
+The same encoding is applied to all channels, reversed immediately after the single
+geometric resampling; final values retain their original units, including negatives.
+This is not a photometric calibration or a permanent intensity normalization.
+
+FITS and raster rows use the same internal coordinate convention; previews retain
+the existing array-row-zero-at-top convention.
+
+Output is still **float32 FITS** with the shared crop and selected suffix, avoiding
+another JPEG compression/quantization step. A TIFF/JPEG pair sharing the same basename
+gets format-qualified output names (for example `image_tif_aligned.fit` and
+`image_jpg_aligned.fit`). Existing files are never overwritten. JPEG EXIF/ICC and TIFF
+container metadata aren't copied wholesale; compatible embedded FITS observational
+metadata is retained. The decoded RGB channel values receive the same mapping.
+
+Siril-style FITS cards in TIFF ImageDescription/JPEG EXIF are reused only when their
+embedded dimensions match and storage orientation is normal. Metadata is discarded
+for rotated/reflected rasters to avoid applying an old WCS to a different grid.
+Matching dimensions alone cannot prove that an image hasn't been edited; prefer a
+fresh solve when uncertain. For distortion-aware alignment without usable embedded
+astrometry, choose **SIP settings → Shared solver**. Native Siril solving still needs
+its usual pointing/scale hints; existing-SIP mode requires valid per-image SIP.
+
+Tests cover 16-bit/float/planar TIFF decoding, orientation, metadata screening,
+alpha/multipage rejection, source preservation, and alignment/crop/export of a
+synthetic nonlinear FITS/TIFF/JPEG field. Native Siril integration also covers a mono
+Astro-TIFF alongside RGB FITS. No real-image TIFF/JPEG collection was supplied for
+this change; synthetic and decoder checks do not guarantee matching every finished
+astrophotograph.
 
 ## Independent SIP distortion correction
 
@@ -174,4 +224,4 @@ See [Siril 1.4.4 registration](https://siril.readthedocs.io/en/stable/preprocess
 [commands](https://siril.readthedocs.io/en/stable/Commands.html), and
 [Python API](https://siril.readthedocs.io/en/stable/Python-API.html).
 
-Standalone: install `numpy scipy astropy astroalign sep PyQt6`, then run the script.
+Standalone: install `numpy scipy astropy astroalign sep PyQt6 Pillow tifffile`, then run the script.

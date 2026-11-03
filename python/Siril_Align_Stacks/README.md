@@ -1,4 +1,11 @@
-# Align Stacks
+# Align Stacks 1.6.0
+
+Star alignment is the default: add images, align, review the shared crop, and save.
+Enable **Correct distortion (SIP · advanced)** when the images have different field
+distortions and stars increasingly diverge toward the edges. This independently
+solves and corrects every image, including the reference; it cannot repair
+differences in star shape or PSF. The processing log is available on demand and
+opens automatically on failure.
 
 Run `Siril_Align_Stacks.py` from Siril's Python scripts menu. Place it in your
 configured Python scripts directory. The dependency helper installs PyQt6,
@@ -7,10 +14,11 @@ Astropy, SciPy, Astroalign, SEP, Pillow and tifffile when needed.
 1. **Add images**: choose two or more mono or RGB FITS, TIFF or JPEG images from any folders.
 2. The first row sets the output grid. Select another row and click **Make reference**
    if needed. Remove a selected row with **Backspace** or **Delete**; its file stays intact.
-3. Choose **Similarity star matching** (the previous method), or **Independent SIP astrometry**.
-   For the latter, open **SIP settings**, check the executable/configuration paths,
-   and normally leave the polynomial order at **3** and solver at **Shared solver** (the new default).
-4. Click **Align / preview**. The log reports solving, validation and stellar residuals.
+3. Leave distortion correction off for normal **star alignment**. No plate solving
+   or solver setup is needed. For differing field distortions, enable
+   **Correct distortion (SIP · advanced)** and open **SIP settings**. Check paths
+   and normally leave order **3** and **ASTAP (shared solver)** selected.
+4. Click **Align images**. **Show processing log** reveals solving, validation and stellar residuals.
 5. The green rectangle starts at the largest rectangle within shared valid coverage.
    Drag a smaller crop or use **Automatic common crop** to reset. Switch previews to inspect.
 6. **Save aligned images** defaults to **Original format**: FITS stays FITS, TIFF
@@ -63,7 +71,7 @@ embedded dimensions match and storage orientation is normal. Metadata is discard
 for rotated/reflected rasters to avoid applying an old WCS to a different grid.
 Matching dimensions alone cannot prove that an image hasn't been edited; prefer a
 fresh solve when uncertain. For distortion-aware alignment without usable embedded
-astrometry, choose **SIP settings → Shared solver**. Native Siril solving still needs
+astrometry, choose **SIP settings → ASTAP (shared solver)**. Native Siril solving still needs
 its usual pointing/scale hints; existing-SIP mode requires valid per-image SIP.
 
 Tests cover 16-bit/float/planar TIFF decoding, orientation, metadata screening,
@@ -250,3 +258,15 @@ See [Siril 1.4.4 registration](https://siril.readthedocs.io/en/stable/preprocess
 [Python API](https://siril.readthedocs.io/en/stable/Python-API.html).
 
 Standalone: install `numpy scipy astropy astroalign sep PyQt6 Pillow tifffile`, then run the script.
+
+## Version 1.6.0
+
+Simplified the main window around the default star alignment workflow, with optional
+SIP correction and its settings shown only when selected. File rows show names with
+full paths in tooltips. Status text explains progress, crop dimensions and save results.
+Alignment/reference buttons follow the file selection; custom suffixes survive mode
+changes. Invalid/non-finite star matches and inconsistent export input lists are
+rejected. Existing crop, preview, output formats and per-image SIP validation remain.
+
+Offscreen interface checks cover defaults, duplicate file selection, reference changes,
+mode switching, suffix preservation, busy state, deletion and failure recovery.

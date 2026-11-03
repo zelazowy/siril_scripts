@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 
 @dataclass
@@ -750,6 +750,8 @@ def largest_rectangle(mask):
 
 def align(paths, report=lambda message: None):
     import astroalign
+    if len(paths) < 2:
+        raise ValueError("Choose at least two images.")
     report("MODE: similarity star matching; distortion correction is OFF.")
     reference, ref_header = read_stack(paths[0])
     target = mono(reference)
@@ -765,7 +767,7 @@ def align(paths, report=lambda message: None):
             mono(data), target, max_control_points=100)
         residual = np.linalg.norm(transform(source_stars) - target_stars, axis=1)
         rms = float(np.sqrt(np.mean(residual ** 2)))
-        if len(residual) < 3 or rms > 2:
+        if len(residual) < 3 or not np.isfinite(residual).all() or rms > 2:
             raise ValueError(f"Unreliable match for {path}: RMS {rms:.2f} px.")
         report(f"{len(residual)} matched stars; RMS {rms:.3f} px; "
                f"rotation {np.degrees(transform.rotation):.3f}°; "
@@ -863,6 +865,8 @@ def write_raster_output(path, original_path, pixels, header):
 
 def save_outputs(paths, images, crop, suffix, output_format="original"):
     from astropy.io import fits
+    if len(paths) < 2 or len(paths) != len(images):
+        raise ValueError("Aligned images do not match the input list. Align again before saving.")
     if not suffix or any(c in suffix for c in '/\\'):
         raise ValueError("Enter a non-empty suffix without path separators.")
     if output_format not in ('original', 'fits'):
@@ -984,8 +988,8 @@ def main():
             self.images = None
             self.worker = None
             layout = Q.QVBoxLayout(self)
-            layout.addWidget(Q.QLabel("Add FITS, TIFF or JPEG images. The first image is the reference.\n"
-                                     "Optionally use Make reference to change it. Delete/Backspace removes a selected stack."))
+            layout.addWidget(Q.QLabel("Align two or more FITS, TIFF or JPEG images. Originals are kept.\n"
+                                     "The first image sets the output grid. Delete/Backspace removes the selected image."))
             self.files = Q.QListWidget()
             self.files.setMaximumHeight(110)
             self.delete_shortcuts = []
@@ -998,21 +1002,22 @@ def main():
             row = Q.QHBoxLayout()
             self.add = Q.QPushButton("Add images…")
             self.reference = Q.QPushButton("Make reference")
-            self.run = Q.QPushButton("Align / preview")
+            self.run = Q.QPushButton("Align images")
             for button in (self.add, self.reference, self.run):
                 row.addWidget(button)
             layout.addLayout(row)
             registration = Q.QHBoxLayout()
-            registration.addWidget(Q.QLabel("Alignment:"))
-            self.mode = Q.QComboBox()
-            self.mode.addItems(["Star matching (similarity)", "Astrometric + SIP distortion correction"])
+            self.mode = Q.QCheckBox("Correct distortion (SIP · advanced)")
             registration.addWidget(self.mode)
             self.settings_button = Q.QPushButton("SIP settings…")
-            self.settings_button.setEnabled(False)
+            self.settings_button.setVisible(False)
             registration.addWidget(self.settings_button)
             layout.addLayout(registration)
+            self.mode_note = Q.QLabel("Star alignment matches position, rotation and scale. Recommended for most images.")
+            self.mode_note.setWordWrap(True)
+            layout.addWidget(self.mode_note)
             self.sip_options = SIPOptions(find_siril_cli(), find_siril_config(configdir))
-            self.mode.currentIndexChanged.connect(self.change_mode)
+            self.mode.toggled.connect(self.change_mode)
             self.settings_button.clicked.connect(self.sip_settings)
             self.preview = Preview()
             layout.addWidget(self.preview)
@@ -1026,28 +1031,49 @@ def main():
             self.output_format = Q.QComboBox()
             self.output_format.addItems(['Original format', 'FITS (float32)'])
             self.save = Q.QPushButton("Save aligned images")
-            for widget in (self.auto, self.choice, Q.QLabel("Suffix:"), self.suffix, self.output_format, self.save):
+            row.addWidget(Q.QLabel("Preview:"))
+            row.addWidget(self.choice, 1)
+            row.addWidget(self.auto)
+            layout.addLayout(row)
+            row = Q.QHBoxLayout()
+            for widget in (Q.QLabel("Save as:"), self.output_format, Q.QLabel("Suffix:"), self.suffix):
                 row.addWidget(widget)
+            row.addStretch()
+            row.addWidget(self.save)
             layout.addLayout(row)
             self.log = Q.QPlainTextEdit()
             self.log.setReadOnly(True)
-            self.log.setMaximumHeight(100)
+            self.log.setMaximumHeight(120)
+            self.status = Q.QLabel("Add at least two images to begin.")
+            self.status.setWordWrap(True)
+            layout.addWidget(self.status)
+            self.details = Q.QCheckBox("Show processing log")
+            self.details.toggled.connect(self.log.setVisible)
+            layout.addWidget(self.details)
+            self.log.setVisible(False)
             layout.addWidget(self.log)
             self.add.clicked.connect(self.add_files)
+            self.files.currentRowChanged.connect(self.update_actions)
             self.reference.clicked.connect(self.make_reference)
             self.run.clicked.connect(self.start)
             self.auto.clicked.connect(lambda: self.preview.set_crop(self.auto_crop))
             self.save.clicked.connect(self.write)
             self.invalidate()
 
-        def change_mode(self, index):
-            self.settings_button.setEnabled(index == 1)
-            self.suffix.setText("_aligned_sip" if index == 1 else "_aligned")
+        def change_mode(self, enabled):
+            self.settings_button.setVisible(enabled)
+            self.mode_note.setText(
+                "Use when images have different field distortions and stars diverge toward the edges. "
+                "Each image, including the reference, is independently solved and corrected. Requires a SIP solution; processing is slower."
+                if enabled else
+                "Star alignment matches position, rotation and scale. Recommended for most images.")
+            if self.suffix.text() in ("_aligned", "_aligned_sip"):
+                self.suffix.setText("_aligned_sip" if enabled else "_aligned")
             self.invalidate()
 
         def sip_settings(self):
             dialog = Q.QDialog(self)
-            dialog.setWindowTitle("Independent SIP solving — Siril 1.4.4")
+            dialog.setWindowTitle("Distortion correction settings")
             form = Q.QFormLayout(dialog)
             order = Q.QSpinBox()
             order.setRange(2, 5)
@@ -1056,7 +1082,7 @@ def main():
             solver.addItems(["Siril solver — fresh solve per stack",
                              "Local Astrometry.net — fresh solve per stack",
                              "Use each input's existing SIP solution",
-                             "Shared solver — independent SIP with recovery"])
+                             "ASTAP (shared solver) — recommended"])
             solvers = ["siril", "astrometry.net", "existing", "astap"]
             solver.setCurrentIndex(solvers.index(self.sip_options.solver))
             form.addRow("SIP polynomial order:", order)
@@ -1081,7 +1107,7 @@ def main():
                             "or local Astrometry.net indices.\n"
                             "No shared distortion master and no automatic uncorrected fallback. "
                             "Existing solutions must contain nonzero SIP coefficients of the selected order. "
-                            "The reference will also be undistorted. TIFF/JPEG without astrometry: use Shared solver or similarity matching. ASTAP needs its star database; "
+                            "The reference will also be undistorted. TIFF/JPEG without astrometry: use ASTAP (shared solver) or star alignment. ASTAP needs its star database; "
                             "recovery changes solver proxies only, never output science pixels.")
             note.setWordWrap(True)
             form.addRow(note)
@@ -1103,13 +1129,25 @@ def main():
             self.choice.clear()
             self.preview.scene_.clear()
             self.preview.box = None
+            self.preview.origin = None
+            self.preview.crop = None
+            self.update_actions()
+            self.status.setText("Ready to align." if self.files.count() >= 2 else "Add at least two images to begin.")
+
+        def update_actions(self, *_):
+            idle = self.worker is None or not self.worker.isRunning()
+            self.run.setEnabled(idle and self.files.count() >= 2)
+            self.reference.setEnabled(idle and self.files.currentRow() > 0)
 
         def add_files(self):
             paths, _ = Q.QFileDialog.getOpenFileNames(self, "Choose stacks", "", "Images (*.fit *.fits *.fts *.tif *.tiff *.jpg *.jpeg *.FIT *.FITS *.TIF *.TIFF *.JPG *.JPEG)")
-            existing = {self.files.item(i).text() for i in range(self.files.count())}
+            existing = {self.files.item(i).data(QtCore.Qt.ItemDataRole.UserRole) for i in range(self.files.count())}
             for path in paths:
                 if path not in existing:
-                    self.files.addItem(path)
+                    item = Q.QListWidgetItem(Path(path).name)
+                    item.setToolTip(path)
+                    item.setData(QtCore.Qt.ItemDataRole.UserRole, path)
+                    self.files.addItem(item)
                     existing.add(path)
             self.invalidate()
 
@@ -1129,17 +1167,21 @@ def main():
         def busy(self, value):
             for widget in (self.files, self.add, self.reference, self.run, self.mode):
                 widget.setEnabled(not value)
-            self.settings_button.setEnabled(not value and self.mode.currentIndex() == 1)
+            self.settings_button.setEnabled(not value)
+            self.run.setText("Aligning…" if value else "Align images")
+            if not value:
+                self.update_actions()
 
         def start(self):
-            self.paths = [self.files.item(i).text() for i in range(self.files.count())]
+            self.paths = [self.files.item(i).data(QtCore.Qt.ItemDataRole.UserRole) for i in range(self.files.count())]
             if len(self.paths) < 2:
                 Q.QMessageBox.warning(self, "Align", "Choose at least two stacks.")
                 return
             self.invalidate()
             self.busy(True)
             self.log.clear()
-            options = self.sip_options if self.mode.currentIndex() == 1 else None
+            self.status.setText("Aligning images…" + (" Solving each image with SIP correction." if self.mode.isChecked() else " Matching stars."))
+            options = self.sip_options if self.mode.isChecked() else None
             self.worker = Worker(self.paths, options)
             self.worker.message.connect(self.log.appendPlainText)
             self.worker.result.connect(self.ready)
@@ -1156,6 +1198,8 @@ def main():
                 self.save.setEnabled(True)
                 self.auto.setEnabled(True)
                 self.log.appendPlainText(f"Ready. Automatic crop: {self.auto_crop}")
+                self.status.setText(f"Aligned{' with SIP correction' if self.mode.isChecked() else ''}. Shared crop: "
+                                    f"{self.auto_crop[2]} × {self.auto_crop[3]} px. Review the preview, then save.")
             except Exception as exc:
                 self.failed(str(exc))
 
@@ -1165,6 +1209,8 @@ def main():
 
         def failed(self, message):
             self.invalidate()
+            self.status.setText("Alignment failed. No outputs saved; see the processing log.")
+            self.details.setChecked(True)
             self.log.appendPlainText("FAILED: " + message + "\nNo fallback outputs accepted.")
             Q.QMessageBox.critical(self, "Alignment failed", message)
 
@@ -1175,6 +1221,7 @@ def main():
                     raise ValueError("Crop includes uncovered edges. Use Automatic common crop or draw a smaller rectangle.")
                 paths = save_outputs(self.paths, self.images, self.preview.crop, self.suffix.text(),
                                      'original' if self.output_format.currentIndex() == 0 else 'fits')
+                self.status.setText(f"Saved {len(paths)} aligned images. Originals kept.")
                 self.log.appendPlainText("Saved:\n" + "\n".join(map(str, paths)))
                 Q.QMessageBox.information(self, "Saved", "\n".join(map(str, paths)))
             except Exception as exc:

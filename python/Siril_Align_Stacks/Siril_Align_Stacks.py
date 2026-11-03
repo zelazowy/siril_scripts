@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 
 
 @dataclass
@@ -925,6 +925,11 @@ def main():
             self.setScene(self.scene_)
             self.setMinimumSize(650, 400)
             self.origin = None
+            self.drag_mode = None
+            self.handles = []
+            self.setMouseTracking(True)
+            self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             self.box = None
             self.crop = None
 
@@ -935,31 +940,113 @@ def main():
             qimage = QtGui.QImage(pixels.data, pixels.shape[1], pixels.shape[0],
                                  pixels.strides[0], QtGui.QImage.Format.Format_Grayscale8).copy()
             self.scene_.clear()
+            self.handles = []
+            self.origin = None
             item = self.scene_.addPixmap(QtGui.QPixmap.fromImage(qimage))
             item.setScale(step)
             self.scene_.setSceneRect(0, 0, image.shape[1], image.shape[0])
             self.box = self.scene_.addRect(QtCore.QRectF(), QtGui.QPen(QtCore.Qt.GlobalColor.green, 0))
+            for _ in range(8):
+                handle = self.scene_.addRect(-3, -3, 6, 6,
+                    QtGui.QPen(QtCore.Qt.GlobalColor.green), QtGui.QBrush(QtCore.Qt.GlobalColor.black))
+                handle.setFlag(Q.QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+                self.handles.append(handle)
             self.set_crop(crop)
-            self.fitInView(self.scene_.sceneRect(), QtCore.Qt.AspectRatioMode.KeepAspectRatio)
+            self.fit_image()
+
+        def fit_image(self):
+            if self.box is not None:
+                self.fitInView(self.scene_.sceneRect(), QtCore.Qt.AspectRatioMode.KeepAspectRatio)
+
+        def resizeEvent(self, event):
+            super().resizeEvent(event)
+            self.fit_image()
 
         def set_crop(self, crop):
             self.crop = crop
-            if self.box:
+            if self.box is not None:
                 self.box.setRect(QtCore.QRectF(*crop))
+                x, y, w, h = crop
+                points = [(x,y), (x+w/2,y), (x+w,y), (x+w,y+h/2),
+                          (x+w,y+h), (x+w/2,y+h), (x,y+h), (x,y+h/2)]
+                for handle, point in zip(self.handles, points):
+                    handle.setPos(*point)
+
+        def hit_test(self, point):
+            if self.box is None or self.crop is None:
+                return None
+            rect = self.box.rect()
+            tolerance = 8 / max(self.transform().m11(), 1e-9)
+            if not rect.adjusted(-tolerance, -tolerance, tolerance, tolerance).contains(point):
+                return "draw"
+            edges = ""
+            if abs(point.x()-rect.left()) <= tolerance:
+                edges += "l"
+            elif abs(point.x()-rect.right()) <= tolerance:
+                edges += "r"
+            if abs(point.y()-rect.top()) <= tolerance:
+                edges += "t"
+            elif abs(point.y()-rect.bottom()) <= tolerance:
+                edges += "b"
+            return edges or ("move" if rect.contains(point) else "draw")
 
         def mousePressEvent(self, event):
-            if self.box and event.button() == QtCore.Qt.MouseButton.LeftButton:
-                self.origin = self.mapToScene(event.position().toPoint())
+            if self.box is not None and event.button() == QtCore.Qt.MouseButton.LeftButton:
+                point = self.mapToScene(event.position().toPoint())
+                if not self.scene_.sceneRect().contains(point):
+                    return
+                self.origin = point
+                self.drag_mode = self.hit_test(point)
+                self.start_crop = self.crop
+                event.accept()
 
         def mouseMoveEvent(self, event):
-            if self.origin is not None:
-                rect = QtCore.QRectF(self.origin, self.mapToScene(event.position().toPoint())).normalized()
-                rect = rect.intersected(self.scene_.sceneRect())
-                x, y = int(np.ceil(rect.x())), int(np.ceil(rect.y()))
-                self.set_crop((x, y, max(0, int(rect.right())-x), max(0, int(rect.bottom())-y)))
+            point = self.mapToScene(event.position().toPoint())
+            if self.origin is None:
+                mode = self.hit_test(point)
+                cursor = {"move": QtCore.Qt.CursorShape.SizeAllCursor,
+                          "l": QtCore.Qt.CursorShape.SizeHorCursor,
+                          "r": QtCore.Qt.CursorShape.SizeHorCursor,
+                          "t": QtCore.Qt.CursorShape.SizeVerCursor,
+                          "b": QtCore.Qt.CursorShape.SizeVerCursor,
+                          "lt": QtCore.Qt.CursorShape.SizeFDiagCursor,
+                          "rb": QtCore.Qt.CursorShape.SizeFDiagCursor,
+                          "rt": QtCore.Qt.CursorShape.SizeBDiagCursor,
+                          "lb": QtCore.Qt.CursorShape.SizeBDiagCursor}.get(mode, QtCore.Qt.CursorShape.CrossCursor)
+                self.setCursor(cursor)
+                return
+            bounds = self.scene_.sceneRect()
+            px = min(max(point.x(), 0), bounds.width())
+            py = min(max(point.y(), 0), bounds.height())
+            x, y, w, h = self.start_crop
+            mode = self.drag_mode
+            if mode == "move":
+                x = int(round(min(max(x + point.x()-self.origin.x(), 0), bounds.width()-w)))
+                y = int(round(min(max(y + point.y()-self.origin.y(), 0), bounds.height()-h)))
+                self.set_crop((x, y, w, h))
+            else:
+                left, top, right, bottom = x, y, x+w, y+h
+                if mode == "draw":
+                    left, right = sorted((self.origin.x(), px))
+                    top, bottom = sorted((self.origin.y(), py))
+                else:
+                    if "l" in mode: left = min(px, right-1)
+                    if "r" in mode: right = max(px, left+1)
+                    if "t" in mode: top = min(py, bottom-1)
+                    if "b" in mode: bottom = max(py, top+1)
+                left, top = int(np.ceil(left)), int(np.ceil(top))
+                right, bottom = int(np.floor(right)), int(np.floor(bottom))
+                if right > left and bottom > top:
+                    self.set_crop((left, top, right-left, bottom-top))
+            event.accept()
 
         def mouseReleaseEvent(self, event):
-            self.origin = None
+            if event.button() == QtCore.Qt.MouseButton.LeftButton:
+                if self.origin is not None:
+                    self.mouseMoveEvent(event)
+                self.origin = None
+                self.drag_mode = None
+                event.accept()
 
     class Worker(QtCore.QThread):
         message = QtCore.pyqtSignal(str)
@@ -985,6 +1072,8 @@ def main():
         def __init__(self):
             super().__init__()
             self.setWindowTitle(f"Align Stacks — {VERSION}")
+            self.setWindowFlag(QtCore.Qt.WindowType.WindowMaximizeButtonHint, True)
+            self.setSizeGripEnabled(True)
             self.images = None
             self.worker = None
             layout = Q.QVBoxLayout(self)
@@ -1021,7 +1110,9 @@ def main():
             self.settings_button.clicked.connect(self.sip_settings)
             self.preview = Preview()
             layout.addWidget(self.preview)
-            layout.addWidget(Q.QLabel("Drag a rectangle for a custom shared crop. Preview stretch is display only."))
+            crop_hint = Q.QLabel("Drag inside the crop to move it; drag an edge or corner to resize. Draw outside to replace it. Preview stretch is display only.")
+            crop_hint.setWordWrap(True)
+            layout.addWidget(crop_hint)
             row = Q.QHBoxLayout()
             self.auto = Q.QPushButton("Automatic common crop")
             self.choice = Q.QComboBox()
@@ -1129,6 +1220,8 @@ def main():
             self.choice.clear()
             self.preview.scene_.clear()
             self.preview.box = None
+            self.preview.handles = []
+            self.preview.drag_mode = None
             self.preview.origin = None
             self.preview.crop = None
             self.update_actions()

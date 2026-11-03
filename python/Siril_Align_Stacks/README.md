@@ -1,4 +1,4 @@
-# Align Stacks 1.6.0
+# Align Stacks 1.6.1
 
 Star alignment is the default: add images, align, review the shared crop, and save.
 Enable **Correct distortion (SIP · advanced)** when the images have different field
@@ -20,7 +20,10 @@ Astropy, SciPy, Astroalign, SEP, Pillow and tifffile when needed.
    and normally leave order **3** and **ASTAP (shared solver)** selected.
 4. Click **Align images**. **Show processing log** reveals solving, validation and stellar residuals.
 5. The green rectangle starts at the largest rectangle within shared valid coverage.
-   Drag a smaller crop or use **Automatic common crop** to reset. Switch previews to inspect.
+   Drag inside the rectangle to move it, or drag its edges/corner handles to resize.
+   Draw outside it to replace it; **Automatic common crop** resets it. Maximise or
+   resize the window for a larger preview; the crop stays in image pixel coordinates.
+   Switch previews to inspect. Saving rejects crops containing uncovered image edges.
 6. **Save aligned images** defaults to **Original format**: FITS stays FITS, TIFF
    stays TIFF and JPEG stays JPEG. The suffix is `_aligned` for similarity or
    `_aligned_sip` for SIP. Choose **FITS (float32)** to retain fractional resampling
@@ -270,3 +273,11 @@ rejected. Existing crop, preview, output formats and per-image SIP validation re
 
 Offscreen interface checks cover defaults, duplicate file selection, reference changes,
 mode switching, suffix preservation, busy state, deletion and failure recovery.
+
+## Version 1.6.1
+
+Enabled window maximisation and automatic preview fitting on window resize. The
+shared crop has eight handles for resizing and can be moved without redrawing.
+Handles and edge hit targets retain their screen size as the preview scales.
+Mouse interaction checks cover moving, corner resizing, replacement, image boundary
+clamping and preserving crop coordinates when enlarging the window.
